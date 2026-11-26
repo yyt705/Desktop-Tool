@@ -138,6 +138,32 @@ namespace DeskFences
             }
         }
 
+        internal bool VerifyItemAt(int index, Point position, string expectedIdentity, Func<string, string> resolveIdentity = null)
+        {
+            if (_view == null || string.IsNullOrEmpty(expectedIdentity) || !_items.ContainsKey(expectedIdentity))
+                return false;
+            IntPtr pidl = IntPtr.Zero, text = IntPtr.Zero;
+            try
+            {
+                NativeMethods.POINT shellPosition;
+                if (_view.Item(index, out pidl) != 0 || pidl == IntPtr.Zero ||
+                    _view.GetItemPosition(pidl, out shellPosition) != 0 ||
+                    shellPosition.X != position.X || shellPosition.Y != position.Y ||
+                    SHGetNameFromIDList(pidl, 0x80028000, out text) != 0)
+                    return false;
+                string name = Marshal.PtrToStringUni(text);
+                if (string.IsNullOrEmpty(name)) return false;
+                string currentId = resolveIdentity != null ? resolveIdentity(name) : DesktopItemIdentity.ForParsingName(name);
+                return StringComparer.OrdinalIgnoreCase.Equals(currentId, expectedIdentity);
+            }
+            catch (COMException) { return false; }
+            finally
+            {
+                Marshal.FreeCoTaskMem(text);
+                Marshal.FreeCoTaskMem(pidl);
+            }
+        }
+
         internal bool VerifyItemIndices(List<DesktopIconInfo> members)
         {
             if (_view == null || members == null || members.Count == 0) return true;

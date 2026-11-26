@@ -265,10 +265,20 @@ namespace DeskFences
                     Check(f.View.SnapChanges == snapBeforeClick && f.View.DirectPositions.Count == 0,
                         "Plain click and double-click must not toggle snap or move icons.");
 
-                    // 2. Real drag past threshold: stays strictly snapped to the desktop grid with positive
-                    //    hysteresis (zero back-and-forth oscillation at ANY pixel!) while parking members offscreen.
+                    // 2. Real drag past threshold: stays strictly snapped to the desktop grid with prompt
+                    //    first-step response (~0.22 cell) and positive hysteresis (zero back-and-forth
+                    //    oscillation at ANY pixel!) while parking members offscreen.
                     f.View.DirectPositions.Clear();
                     press();
+                    // Verify prompt first step: moving just 0.25 cell immediately steps onto col 2 (not waiting for 0.56 cell!)
+                    moving.MovePointer(Cell / 4, 0);
+                    Check(moving.Config.OuterCol == 2,
+                        "Dragging 0.25 cell must immediately step onto the adjacent grid column! Observed col=" + moving.Config.OuterCol);
+                    Check(moving.Bounds.X == frame.X + Cell || moving.Bounds.X > frame.X,
+                        "Immediate frame-0 animation must visibly move the fence on the same mouse event.");
+                    // Return to origin cleanly before running full monotonic sweep
+                    moving.MovePointer(0, 0);
+                    Check(moving.Config.OuterCol == 1, "Returning to 0px must return cleanly to col 1.");
                     int prevCol = moving.Config.OuterCol;
                     for (int px = 2; px <= 2 * Cell; px += 2)
                     {
@@ -286,9 +296,17 @@ namespace DeskFences
                         prevCol = moving.Config.OuterCol;
                     }
                     Check(moving.Config.OuterCol == 2, "Sweeping back to 1 cell must land cleanly at col 2.");
-                    // Small tremor around the 0.5 midpoint must NOT oscillate!
-                    moving.MovePointer((int)(0.58 * Cell), 0); // snaps to col 2 (step 1)
+                    // Small tremor around the 0.16 deadband AND around 0.50 midpoint must NOT oscillate!
+                    moving.MovePointer((int)(0.25 * Cell), 0); // snaps to col 2 (step 1)
                     int settledStepCol = moving.Config.OuterCol;
+                    for (int t = 0; t < 4; t++)
+                    {
+                        moving.MovePointer((int)(0.20 * Cell), 0);
+                        Check(moving.Config.OuterCol == settledStepCol, "Tremor near 0<->1 transition deadband must not oscillate!");
+                        moving.MovePointer((int)(0.13 * Cell), 0);
+                        Check(moving.Config.OuterCol == settledStepCol, "Tremor near 0<->1 transition deadband must not oscillate!");
+                    }
+                    moving.MovePointer((int)(0.58 * Cell), 0);
                     for (int t = 0; t < 4; t++)
                     {
                         moving.MovePointer((int)(0.52 * Cell), 0);
@@ -351,6 +369,51 @@ namespace DeskFences
                     Set(f.Manager, "_exiting", false);
                     verifyRest(0, "After mid-drag exit settlement");
 
+                    // 4b. Fast member-only BeginFenceDrag path + PreWarm staleness rejection:
+                    //     after a clean drop, an immediate back-to-back drag must step cleanly on the fast path,
+                    //     and a pre-warm snapshot with changed selection/position must be rejected cleanly.
+                    f.View.DirectPositions.Clear();
+                    press();
+                    moving.MovePointer(Cell, 0);
+                    Check(moving.Config.OuterCol == 2, "Immediate back-to-back fast-path drag must step cleanly to col 2. Observed=" + moving.Config.OuterCol);
+                    moving.Release();
+                    finishDrop(true);
+                    verifyRest(1, "After back-to-back fast-path drag drop");
+
+                    // Verify TryAdoptPreWarm accepts exact match and rejects stale Selected / ClientPosition
+                    var preWarmType = typeof(FenceChromeForm).GetNestedType("DragPreWarm", Instance);
+                    var adoptMethod = typeof(FenceChromeForm).GetMethod("TryAdoptPreWarm", Instance);
+                    var liveMembers = f.Controller.GetAllIcons().Take(2).ToList();
+                    typeof(FenceChromeForm).GetField("_capturedMembers", Instance).SetValue(moving, liveMembers);
+                    Rectangle bodyRect = new Rectangle(moving.Location.X, moving.Location.Y + moving.HeaderHeight,
+                        moving.Width, Math.Max(2, moving.Height - moving.HeaderHeight));
+                    using (var fakeBmp = new Bitmap(bodyRect.Width, bodyRect.Height, PixelFormat.Format32bppPArgb))
+                    {
+                        object pre = Activator.CreateInstance(preWarmType);
+                        preWarmType.GetField("Layer").SetValue(pre, fakeBmp);
+                        preWarmType.GetField("FenceBounds").SetValue(pre, moving.Bounds);
+                        preWarmType.GetField("HeaderHeight").SetValue(pre, moving.HeaderHeight);
+                        preWarmType.GetField("HostGeneration").SetValue(pre, f.Manager.CurrentHostGeneration);
+                        preWarmType.GetField("DesktopItemCount").SetValue(pre, f.Manager.GetDesktopItemCount());
+                        preWarmType.GetField("AnySelected").SetValue(pre, false);
+                        preWarmType.GetField("DesktopWasForeground").SetValue(pre, false);
+                        preWarmType.GetField("CapturedAtMs").SetValue(pre, f.Manager.SessionElapsedMs);
+                        var staleMembers = new List<DesktopIconInfo>(liveMembers);
+                        var mutated = staleMembers[0];
+                        mutated.Selected = !mutated.Selected;
+                        staleMembers[0] = mutated;
+                        preWarmType.GetField("Members").SetValue(pre, staleMembers);
+                        object[] argsStale = new object[] { pre, bodyRect, null };
+                        Check(!(bool)adoptMethod.Invoke(moving, argsStale) && argsStale[2] == null,
+                            "Pre-warm snapshot MUST be rejected when any member's Selected state changed!");
+
+                        preWarmType.GetField("Members").SetValue(pre, new List<DesktopIconInfo>(liveMembers));
+                        object[] argsFresh = new object[] { pre, bodyRect, null };
+                        Check((bool)adoptMethod.Invoke(moving, argsFresh) && object.ReferenceEquals(argsFresh[2], fakeBmp),
+                            "Pre-warm snapshot MUST be adopted when every member's live bounds & state match!");
+                    }
+                    typeof(FenceChromeForm).GetField("_capturedMembers", Instance).SetValue(moving, null);
+
                     // 5. Mid-drag index shift regression: if ListView indices reorder during drag,
                     //    CommitRigidDragDrop must NOT use stale LVM_SETITEMPOSITION32 indices to move wrong items!
                     press();
@@ -373,6 +436,63 @@ namespace DeskFences
                 {
                     DeleteObject(observed);
                     DeleteObject(baseline);
+                }
+            }
+        }
+
+        private static void CheckGridStepping()
+        {
+            const int c = 100;
+            // 1. Prompt initial breakout (~0.22 cell) in both directions
+            Check(FenceChromeForm.ComputeGridStep(21, c, 0) == 0, "Below 0.22 cell should stay at origin.");
+            Check(FenceChromeForm.ComputeGridStep(22, c, 0) == 1, "At 0.22 cell must immediately advance to +1.");
+            Check(FenceChromeForm.ComputeGridStep(-21, c, 0) == 0, "Above -0.22 cell should stay at origin.");
+            Check(FenceChromeForm.ComputeGridStep(-22, c, 0) == -1, "At -0.22 cell must immediately advance to -1.");
+
+            // 2. Full forward & backward pixel sweeps across -3..+3 cells must be strictly monotonic
+            int step = -3;
+            for (int px = -3 * c; px <= 3 * c; px++)
+            {
+                int next = FenceChromeForm.ComputeGridStep(px, c, step);
+                Check(next >= step, "Forward sweep oscillated backward at px=" + px + ": " + step + " -> " + next);
+                step = next;
+            }
+            Check(step == 3, "Forward sweep must end at +3.");
+
+            for (int px = 3 * c; px >= -3 * c; px--)
+            {
+                int next = FenceChromeForm.ComputeGridStep(px, c, step);
+                Check(next <= step, "Backward sweep oscillated forward at px=" + px + ": " + step + " -> " + next);
+                step = next;
+            }
+            Check(step == -3, "Backward sweep must end at -3.");
+
+            // 3. Exact odd symmetry across all offsets and steps
+            for (int cur = -3; cur <= 3; cur++)
+            {
+                for (int px = -350; px <= 350; px += 5)
+                {
+                    int pos = FenceChromeForm.ComputeGridStep(px, c, cur);
+                    int neg = FenceChromeForm.ComputeGridStep(-px, c, -cur);
+                    Check(neg == -pos, "Grid stepping symmetry violated at cur=" + cur + ", px=" + px + ": " + pos + " vs " + neg);
+                }
+            }
+
+            // 4. Positive 0.12-cell hysteresis deadband at EVERY transition boundary (0<->1, 1<->2, 2<->3, and negatives)
+            int[] fwdPx = { 22, 138, 254, -22, -138, -254 };
+            int[] startStep = { 0, 1, 2, 0, -1, -2 };
+            int[] enteredStep = { 1, 2, 3, -1, -2, -3 };
+            for (int i = 0; i < fwdPx.Length; i++)
+            {
+                int s = FenceChromeForm.ComputeGridStep(fwdPx[i], c, startStep[i]);
+                Check(s == enteredStep[i], "Expected transition to " + enteredStep[i] + " at px=" + fwdPx[i]);
+                int sign = Math.Sign(fwdPx[i]);
+                // Tremor of 1..10px back toward origin inside the 12px deadband must NEVER flip back!
+                for (int back = 1; back <= 10; back++)
+                {
+                    int jitterPx = fwdPx[i] - sign * back;
+                    Check(FenceChromeForm.ComputeGridStep(jitterPx, c, s) == s,
+                        "Oscillation detected inside deadband at boundary " + fwdPx[i] + ", jitterPx=" + jitterPx);
                 }
             }
         }
@@ -552,6 +672,7 @@ namespace DeskFences
             var paths = new[] { "Alpha", "Bravo", "Gamma", "Delta", "Echo" }.Select(name => Path.Combine(dir, name + ".txt")).ToArray();
             foreach (string path in paths) File.WriteAllText(path, Path.GetFileName(path));
             PrivateDesktopView.OnPrivateDesktop(delegate {
+                CheckGridStepping();
                 CheckCollision(paths.Take(2).ToArray(), true, true);
                 CheckCollision(paths.Take(2).ToArray(), false, true);
                 CheckCollision(paths.Take(2).ToArray(), true, false);

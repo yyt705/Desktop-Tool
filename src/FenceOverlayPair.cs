@@ -524,6 +524,29 @@ namespace DeskFences
         private bool _dragRelocated;
         private bool _isDragOverlapping;
         private Bitmap _dragNativeIconsLayer;
+        private sealed class DragPreWarm : IDisposable
+        {
+            public Bitmap Layer;
+            public Rectangle FenceBounds;
+            public int HeaderHeight;
+            public int HostGeneration;
+            public int DesktopItemCount;
+            public bool AnySelected;
+            public bool DesktopWasForeground;
+            public long CapturedAtMs;
+            public List<DesktopIconInfo> Members;
+
+            public void Dispose()
+            {
+                if (Layer != null)
+                {
+                    Layer.Dispose();
+                    Layer = null;
+                }
+            }
+        }
+        private DragPreWarm _dragPreWarm;
+        private readonly Timer _hoverWarmTimer;
         private Point _dragStartMouse;
         private Point? _lastDragCandidate;
         private bool _dragDpiChanged;
@@ -560,6 +583,7 @@ namespace DeskFences
         // Smooth frame-rate-independent exponential spring animation
         private readonly Timer _animTimer;
         private readonly Stopwatch _animWatch = new Stopwatch();
+        private bool _holdingHighResTimer;
         private double _animLastMs;
         private double _curX, _curY, _curW, _curH;
         private Rectangle _animTargetBounds;
@@ -588,8 +612,34 @@ namespace DeskFences
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
 
-            _animTimer = new Timer { Interval = 10 };
+            _animTimer = new Timer { Interval = 8 };
             _animTimer.Tick += OnAnimTimerTick;
+
+            _hoverWarmTimer = new Timer { Interval = 80 };
+            _hoverWarmTimer.Tick += OnHoverWarmTimerTick;
+        }
+
+        private void StartAnimTimer()
+        {
+            if (!_holdingHighResTimer)
+            {
+                NativeMethods.AcquireHighResTimer();
+                _holdingHighResTimer = true;
+            }
+            if (!_animTimer.Enabled)
+                _animTimer.Start();
+        }
+
+        private void StopAnimTimer()
+        {
+            if (_animTimer != null && _animTimer.Enabled)
+                _animTimer.Stop();
+            _animWatch.Stop();
+            if (_holdingHighResTimer)
+            {
+                _holdingHighResTimer = false;
+                NativeMethods.ReleaseHighResTimer();
+            }
         }
 
         private void RebuildFonts()
@@ -742,9 +792,9 @@ namespace DeskFences
         public void SyncBoundsFromGrid(DesktopGridMetrics m)
         {
             CloseRenamePopup();
+            ClearDragPreWarm();
             SettleInteraction(_manager.CanCommitToCurrentDesktop(), false);
-            _animTimer.Stop();
-            _animWatch.Stop();
+            StopAnimTimer();
             Bounds = ComputeGridBounds(m);
             if (_desktopVisible)
             {
@@ -761,6 +811,7 @@ namespace DeskFences
             if (!visible)
             {
                 CloseRenamePopup();
+                ClearDragPreWarm();
                 Hide();
                 if (Backdrop != null && !Backdrop.IsDisposed) Backdrop.HideBackdrop();
             }
@@ -806,8 +857,10 @@ namespace DeskFences
 
         private void StepAnimation(double dt)
         {
-            // Crisp, taut exponential spring (34.0) so grid steps feel immediately responsive.
-            double alpha = 1.0 - Math.Exp(-dt * 34.0);
+            // Ultra-crisp magnetic spring during active grid dragging (48.0),
+            // softer landing glide (30.0) on release / overlap auto-relocation / resize.
+            double stiffness = _isDragging ? 48.0 : 30.0;
+            double alpha = 1.0 - Math.Exp(-dt * stiffness);
 
             _curX += (_animTargetBounds.X - _curX) * alpha;
             _curY += (_animTargetBounds.Y - _curY) * alpha;
@@ -870,14 +923,26 @@ namespace DeskFences
 
         private void FinishAnimation()
         {
-            _animTimer.Stop();
-            _animWatch.Stop();
+            StopAnimTimer();
             if (_dragReleasePending)
                 CompleteRigidDrag(true, true);
             else if (_releasePending)
                 CompleteResize(true, true);
             else
                 ApplyResizeFrame(1.0, true);
+        }
+
+        private void PumpAnimationIfDue(bool forceImmediate = false)
+        {
+            if (!_animTimer.Enabled) return;
+            double nowMs = _animWatch.Elapsed.TotalMilliseconds;
+            double elapsedMs = nowMs - _animLastMs;
+            if (!forceImmediate && elapsedMs < 6.0) return;
+            _animLastMs = nowMs;
+            double dt = forceImmediate
+                ? Math.Max(0.012, Math.Min(0.04, elapsedMs / 1000.0))
+                : Math.Min(0.05, Math.Max(0.004, elapsedMs / 1000.0));
+            StepAnimation(dt);
         }
 
         private void AnimateToBounds(Rectangle target)
@@ -898,10 +963,16 @@ namespace DeskFences
                 _curH = Bounds.Height;
                 _animWatch.Restart();
                 _animLastMs = 0;
-                _animTimer.Start();
+                StartAnimTimer();
                 // Step immediately on frame 0 so the fence reacts on the very same mouse event
-                // instead of waiting 15.6ms for the first WinForms timer tick.
+                // instead of waiting for the first WinForms timer tick.
                 StepAnimation(0.016);
+            }
+            else
+            {
+                // Advance immediately on target change even when high-Hz WM_MOUSEMOVE events
+                // are arriving faster than low-priority WM_TIMER ticks.
+                PumpAnimationIfDue(true);
             }
         }
 
@@ -924,23 +995,165 @@ namespace DeskFences
             Backdrop.SyncVisuals(bodyRect, theme.BodyGlaze, theme.TopCaustic, theme.BottomBounce, Config.BackdropOpacity, Math.Max(6, CornerRadius - inset));
         }
 
+        internal void ClearDragPreWarm()
+        {
+            if (_hoverWarmTimer != null && _hoverWarmTimer.Enabled)
+                _hoverWarmTimer.Stop();
+            if (_dragPreWarm != null)
+            {
+                _dragPreWarm.Dispose();
+                _dragPreWarm = null;
+            }
+        }
+
+        private bool HasFreshPreWarmForCurrentBounds()
+        {
+            return _dragPreWarm != null &&
+                   _dragPreWarm.Layer != null &&
+                   _dragPreWarm.FenceBounds == Bounds &&
+                   _dragPreWarm.HeaderHeight == HeaderHeight &&
+                   _dragPreWarm.HostGeneration == _manager.CurrentHostGeneration &&
+                   (_manager.SessionElapsedMs - _dragPreWarm.CapturedAtMs) <= 1200;
+        }
+
+        private void ScheduleHoverPreWarm()
+        {
+            if (IsDisposed || !IsHandleCreated || !Visible || _manager.Config.Locked ||
+                Config.MemberIconIds.Count == 0 || _manager.IsBusy || IsInteracting)
+                return;
+            if (HasFreshPreWarmForCurrentBounds()) return;
+            if (!_hoverWarmTimer.Enabled)
+                _hoverWarmTimer.Start();
+        }
+
+        private void OnHoverWarmTimerTick(object sender, EventArgs e)
+        {
+            _hoverWarmTimer.Stop();
+            if (IsDisposed || !IsHandleCreated || !Visible || _manager.Config.Locked ||
+                _isDragging || _dragPending || _resizeEdge != ResizeEdge.None || _pendingResizeEdge != ResizeEdge.None)
+                return;
+            Point local = PointToClient(Cursor.Position);
+            if (local.X < 0 || local.X >= Width || local.Y < 0 || local.Y > HeaderHeight ||
+                GetMenuButtonRect().Contains(local) || HitTestResizeEdge(local) != ResizeEdge.None)
+                return;
+            TryPreWarmDragCapture();
+        }
+
+        internal bool TryPreWarmDragCapture()
+        {
+            if (IsDisposed || !IsHandleCreated || !Visible || _manager.Config.Locked ||
+                !_manager.DesktopReady || _manager.IsBusy || Config.MemberIconIds.Count == 0)
+                return false;
+
+            List<DesktopIconInfo> members;
+            int hostGen, itemCount;
+            if (!_manager.TryGetLiveMembersForPreWarm(this, out members, out hostGen, out itemCount) ||
+                members == null || members.Count == 0)
+            {
+                ClearDragPreWarm();
+                return false;
+            }
+
+            int hh = HeaderHeight;
+            Rectangle bodyScreenRect = new Rectangle(Location.X, Location.Y + hh, Width, Math.Max(2, Height - hh));
+            IntPtr lv = _manager.GetDesktopListViewHandle();
+            if (lv == IntPtr.Zero) return false;
+
+            bool usedTrueAlpha;
+            Bitmap bmp = NativeMethods.CaptureNativeListViewIconsTransparent(lv, bodyScreenRect, members, out usedTrueAlpha);
+            if (bmp == null) return false;
+            // Only cache bit-exact true 32-bit ARGB captures (NEVER cache fallback modes!).
+            if (!usedTrueAlpha)
+            {
+                bmp.Dispose();
+                return false;
+            }
+
+            ClearDragPreWarm();
+            bool anySelected = false;
+            for (int i = 0; i < members.Count; i++)
+            {
+                if (members[i].Selected) { anySelected = true; break; }
+            }
+            _dragPreWarm = new DragPreWarm
+            {
+                Layer = bmp,
+                FenceBounds = Bounds,
+                HeaderHeight = hh,
+                HostGeneration = hostGen,
+                DesktopItemCount = itemCount,
+                AnySelected = anySelected,
+                DesktopWasForeground = _manager.IsDesktopListViewForeground(),
+                CapturedAtMs = _manager.SessionElapsedMs,
+                Members = members
+            };
+            return true;
+        }
+
+        private bool TryAdoptPreWarm(DragPreWarm pre, Rectangle bodyScreenRect, out Bitmap layer)
+        {
+            layer = null;
+            if (pre == null || pre.Layer == null || _capturedMembers == null) return false;
+            if (pre.FenceBounds != Bounds || pre.HeaderHeight != HeaderHeight) return false;
+            if (pre.Layer.Width != bodyScreenRect.Width || pre.Layer.Height != bodyScreenRect.Height) return false;
+            if (pre.HostGeneration != _manager.CurrentHostGeneration) return false;
+            if (pre.DesktopItemCount != _manager.GetDesktopItemCount()) return false;
+            if ((_manager.SessionElapsedMs - pre.CapturedAtMs) > 1500) return false;
+            if (pre.Members == null || pre.Members.Count != _capturedMembers.Count) return false;
+            if (pre.AnySelected && pre.DesktopWasForeground != _manager.IsDesktopListViewForeground()) return false;
+
+            for (int i = 0; i < _capturedMembers.Count; i++)
+            {
+                var a = pre.Members[i];
+                var b = _capturedMembers[i];
+                if (a.Index != b.Index ||
+                    !StringComparer.OrdinalIgnoreCase.Equals(a.Identity, b.Identity) ||
+                    a.ClientPosition != b.ClientPosition ||
+                    a.ScreenBounds != b.ScreenBounds ||
+                    a.IconBounds != b.IconBounds ||
+                    a.LabelBounds != b.LabelBounds ||
+                    a.Selected != b.Selected)
+                {
+                    return false;
+                }
+            }
+
+            layer = pre.Layer;
+            pre.Layer = null;
+            return true;
+        }
+
         private void EnterRigidDragSurface()
         {
             DisposeDragVisuals();
             _membersParked = false;
+            var pre = _dragPreWarm;
+            _dragPreWarm = null;
+            if (_hoverWarmTimer != null && _hoverWarmTimer.Enabled)
+                _hoverWarmTimer.Stop();
 
             bool hasMembers = _capturedMembers != null && _capturedMembers.Count > 0;
             if (!hasMembers)
             {
+                if (pre != null) pre.Dispose();
                 _isDragSurfaceActive = false;
                 return;
             }
 
             int hh = HeaderHeight;
             Rectangle bodyScreenRect = new Rectangle(Location.X, Location.Y + hh, Width, Math.Max(2, Height - hh));
-            IntPtr lv = _manager.GetDesktopListViewHandle();
-            if (lv != IntPtr.Zero)
-                _dragNativeIconsLayer = NativeMethods.CaptureNativeListViewIconsTransparent(lv, bodyScreenRect, _capturedMembers);
+            Bitmap adopted;
+            if (TryAdoptPreWarm(pre, bodyScreenRect, out adopted))
+            {
+                _dragNativeIconsLayer = adopted;
+            }
+            else
+            {
+                if (pre != null) pre.Dispose();
+                IntPtr lv = _manager.GetDesktopListViewHandle();
+                if (lv != IntPtr.Zero)
+                    _dragNativeIconsLayer = NativeMethods.CaptureNativeListViewIconsTransparent(lv, bodyScreenRect, _capturedMembers);
+            }
 
             if (_dragNativeIconsLayer == null)
             {
@@ -1315,7 +1528,8 @@ namespace DeskFences
             ResizeEdge edge = HitTestResizeEdge(e.Location);
             if (edge != ResizeEdge.None)
             {
-                _animTimer.Stop();
+                StopAnimTimer();
+                ClearDragPreWarm();
                 _pendingResizeEdge = edge;
                 _resizeStartMouse = Cursor.Position;
                 Capture = true;
@@ -1324,10 +1538,16 @@ namespace DeskFences
 
             if (e.Y <= HeaderHeight && !_manager.Config.Locked)
             {
-                _animTimer.Stop();
+                StopAnimTimer();
+                if (_hoverWarmTimer.Enabled) _hoverWarmTimer.Stop();
                 _dragPending = true;
                 _dragStartMouse = Cursor.Position;
                 Capture = true;
+                // If user flicked onto the title bar faster than the 80ms hover pre-warm,
+                // overlap the read-only PrintWindow capture with the natural press-to-move hand latency
+                // (never parks icons, never toggles snap, never activates drag surface on plain clicks).
+                if (Config.MemberIconIds.Count > 0 && !HasFreshPreWarmForCurrentBounds())
+                    TryPreWarmDragCapture();
             }
         }
 
@@ -1428,7 +1648,7 @@ namespace DeskFences
                 if (Math.Abs(cur.X - _dragStartMouse.X) >= 2 || Math.Abs(cur.Y - _dragStartMouse.Y) >= 2)
                 {
                     if (StartActualDrag())
-                        MoveDragTo(cur);
+                        MoveDragTo(Cursor.Position);
                 }
                 return;
             }
@@ -1550,11 +1770,23 @@ namespace DeskFences
 
             ResizeEdge hoverEdge = HitTestResizeEdge(e.Location);
             if (hoverEdge != ResizeEdge.None)
+            {
+                if (_hoverWarmTimer.Enabled) _hoverWarmTimer.Stop();
                 Cursor = EdgeToCursor(hoverEdge);
+            }
             else if (hm)
+            {
+                if (_hoverWarmTimer.Enabled) _hoverWarmTimer.Stop();
                 Cursor = Cursors.Hand;
+            }
             else
+            {
                 Cursor = Cursors.Default;
+                if (e.Y <= HeaderHeight)
+                    ScheduleHoverPreWarm();
+                else if (_hoverWarmTimer.Enabled)
+                    _hoverWarmTimer.Stop();
+            }
         }
 
         private void MoveDragTo(Point cursor)
@@ -1566,8 +1798,9 @@ namespace DeskFences
             int dx = cursor.X - _dragStartMouse.X;
             int dy = cursor.Y - _dragStartMouse.Y;
 
-            // Strict desktop grid stepping with positive Schmitt-trigger hysteresis (0.56 / 0.44):
-            // guarantees zero back-and-forth oscillation at any mouse position or cell boundary.
+            // Strict desktop grid stepping with responsive initial breakout (0.22 cell) and
+            // guaranteed 0.12-cell positive Schmitt-trigger hysteresis at EVERY boundary:
+            // feels immediate on the first pull while remaining mathematically impossible to oscillate.
             _dragStepCol = ComputeGridStep(dx, cw, _dragStepCol);
             _dragStepRow = ComputeGridStep(dy, ch, _dragStepRow);
             var desired = new Point(_dragStartOuterCol + _dragStepCol, _dragStartOuterRow + _dragStepRow);
@@ -1575,7 +1808,11 @@ namespace DeskFences
             Rectangle area = MonitorGrid.BestArea(_dragWorkAreas, desired, size, _dragMetrics);
             if (area.Width < size.Width || area.Height < size.Height) return;
             Point target = MonitorGrid.ClampOrigin(area, desired, size);
-            if (_lastDragCandidate == target) return;
+            if (_lastDragCandidate == target)
+            {
+                PumpAnimationIfDue(false);
+                return;
+            }
             _lastDragCandidate = target;
 
             Config.OuterCol = target.X;
@@ -1591,14 +1828,28 @@ namespace DeskFences
             AnimateToBounds(ComputeGridBounds(_dragMetrics));
         }
 
+        private static double RightStepThreshold(int step)
+        {
+            if (step == 0) return 0.22;
+            if (step == 1) return 1.38;
+            if (step >= 2) return step + 0.54;
+            if (step == -1) return -0.10;
+            if (step == -2) return -1.26;
+            return step + 0.58;
+        }
+
+        private static double LeftStepThreshold(int step)
+        {
+            return -RightStepThreshold(-step);
+        }
+
         internal static int ComputeGridStep(int deltaPx, int cellPx, int currentStep)
         {
             double cells = deltaPx / (double)cellPx;
-            const double threshold = 0.56;
-            if (cells >= currentStep + threshold)
-                return (int)Math.Floor(cells + (1.0 - threshold));
-            if (cells <= currentStep - threshold)
-                return (int)Math.Ceiling(cells - (1.0 - threshold));
+            while (cells >= RightStepThreshold(currentStep))
+                currentStep++;
+            while (cells <= LeftStepThreshold(currentStep))
+                currentStep--;
             return currentStep;
         }
 
@@ -1793,8 +2044,7 @@ namespace DeskFences
             _completingInteraction = true;
             _dragReleasePending = false;
             _isDragging = false;
-            _animTimer.Stop();
-            _animWatch.Stop();
+            StopAnimTimer();
 
             var captured = _capturedMembers;
             bool wereParked = _membersParked;
@@ -1900,8 +2150,7 @@ namespace DeskFences
             if (_completingInteraction) return;
             _completingInteraction = true;
             _releasePending = false;
-            _animTimer.Stop();
-            _animWatch.Stop();
+            StopAnimTimer();
             try
             {
                 if (applyIconPositions)
@@ -1933,6 +2182,7 @@ namespace DeskFences
         protected override void OnMouseLeave(EventArgs e)
         {
             base.OnMouseLeave(e);
+            ClearDragPreWarm();
             if (_hoverMenuBtn)
             {
                 _hoverMenuBtn = false;
@@ -1945,12 +2195,14 @@ namespace DeskFences
             base.OnMouseDoubleClick(e);
             if (e.Button == MouseButtons.Left && e.Y <= HeaderHeight && !GetMenuButtonRect().Contains(e.Location))
             {
+                ClearDragPreWarm();
                 BeginInlineRename();
             }
         }
 
         public void BeginInlineRename()
         {
+            ClearDragPreWarm();
             if (!_manager.PrepareFenceInteraction()) return;
             if (_renamePopup != null) return;
             FenceTheme theme = FenceTheme.Resolve(Config.ThemeId);
@@ -2013,6 +2265,7 @@ namespace DeskFences
 
         private void ShowContextMenu(Point localPt)
         {
+            ClearDragPreWarm();
             FenceTheme theme = FenceTheme.Resolve(Config.ThemeId);
             bool menuLight = theme.IsLightMenu;
             var menu = Win11MenuRenderer.CreateWin11Menu(menuLight, theme.AccentColor, DpiScale);
@@ -2089,10 +2342,16 @@ namespace DeskFences
             {
                 if (_isDragging || _dragReleasePending || _resizeEdge != ResizeEdge.None || _releasePending)
                     SettleInteraction(_manager.CanCommitToCurrentDesktop(), false);
+                ClearDragPreWarm();
                 DisposeDragVisuals();
+                if (_hoverWarmTimer != null)
+                {
+                    _hoverWarmTimer.Stop();
+                    _hoverWarmTimer.Dispose();
+                }
+                StopAnimTimer();
                 if (_animTimer != null)
                 {
-                    _animTimer.Stop();
                     _animTimer.Dispose();
                 }
                 if (_renamePopup != null)

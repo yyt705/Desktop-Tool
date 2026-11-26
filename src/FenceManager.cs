@@ -242,6 +242,8 @@ namespace DeskFences
         private long _burstUntilMs = -1;
         private bool _desktopDirty = true;
         private DesktopGridMetrics _lastGridMetrics;
+        private int _lastRawItemSpacing;
+        private bool _lastDropClean;
         private long _lastFullScanMs = -10000;
         private int _lastItemCount = -1;
         private bool _fencesHiddenByUser;
@@ -1038,6 +1040,7 @@ namespace DeskFences
                     {
                         _controller.InvalidateIdentityCache();
                         _desktopDirty = true;
+                        foreach (var form in _forms.Values) form.ClearDragPreWarm();
                         TriggerSubFrameBurstCheck();
                     }));
                 }
@@ -1135,7 +1138,10 @@ namespace DeskFences
                 bool sameView = available && !hostChanged;
                 FinishIconAnimationImmediately(sameView);
                 foreach (var form in _forms.Values.ToList())
+                {
+                    form.ClearDragPreWarm();
                     form.SettleInteraction(sameView, false);
+                }
                 _burstWatchTimer.Stop();
                 _burstUntilMs = -1;
                 ResetDesktopInput();
@@ -1550,6 +1556,96 @@ namespace DeskFences
                 _controller.MoveIconsBatch(moves);
         }
 
+        internal bool IsBusy
+        {
+            get { return _isMutatingFence || _isEnforcing || _isAnimatingIcons || _isDrawingRegion || _rebindingDesktop; }
+        }
+
+        internal int CurrentHostGeneration { get { return _controller.HostGeneration; } }
+        internal long SessionElapsedMs { get { return _sessionClock.ElapsedMilliseconds; } }
+        internal int GetDesktopItemCount() { return _controller.GetDesktopItemCount(); }
+
+        internal bool IsDesktopListViewForeground()
+        {
+            if (!DesktopReady) return false;
+            IntPtr fg = NativeMethods.GetForegroundWindow();
+            return fg != IntPtr.Zero &&
+                   (fg == _controller.DesktopOwner || fg == _controller.DefView || fg == _controller.ListView);
+        }
+
+        internal bool TryGetLiveMembersForPreWarm(
+            FenceChromeForm form,
+            out List<DesktopIconInfo> members,
+            out int hostGen,
+            out int itemCount)
+        {
+            members = null;
+            hostGen = _controller.HostGeneration;
+            itemCount = -1;
+            if (!DesktopReady || IsBusy || form == null || form.Config.MemberIconIds.Count == 0)
+                return false;
+
+            int generation = _controller.HostGeneration;
+            IntPtr view = _controller.ListView;
+            var memberSet = new HashSet<string>(form.Config.MemberIconIds, StringComparer.OrdinalIgnoreCase);
+
+            int liveCount = _controller.GetDesktopItemCount();
+            if (!_desktopDirty &&
+                _inputSnapshot != null && _inputSnapshot.Count > 0 &&
+                _lastGridMetrics.CellWidth > 0 && _lastGridMetrics.CellHeight > 0 &&
+                form.Config.MemberIconNames.Count == 0 &&
+                liveCount == _inputSnapshot.Count &&
+                _controller.HasShellItemCount(liveCount) &&
+                _controller.GetRawItemSpacing() == _lastRawItemSpacing)
+            {
+                var metrics = _controller.GetLiveStyleMetrics(_lastGridMetrics);
+                if (metrics.AutoArrangeEnabled) return false;
+                var candidates = _inputSnapshot.FindAll(item => memberSet.Contains(item.Identity));
+                List<DesktopIconInfo> fresh;
+                if (_controller.TryRefreshIconsLive(candidates, out fresh) &&
+                    DesktopReady && _controller.HostGeneration == generation && _controller.ListView == view)
+                {
+                    UpdateInputSnapshotSubset(fresh);
+                    members = fresh.FindAll(item => form.Config.IsInInnerRect(item.GridCol(metrics), item.GridRow(metrics)));
+                    hostGen = generation;
+                    itemCount = liveCount;
+                    return true;
+                }
+            }
+
+            // Fallback: full live snapshot (read-only) also primes _inputSnapshot so the upcoming drag hits the 1ms fast path!
+            var all = _controller.GetAllIcons(false);
+            var fullMetrics = _controller.GetGridMetrics(all);
+            if (!_controller.SnapshotComplete || !DesktopReady ||
+                _controller.HostGeneration != generation || _controller.ListView != view)
+                return false;
+            _inputSnapshot = all;
+            _lastGridMetrics = fullMetrics;
+            _lastRawItemSpacing = _controller.GetRawItemSpacing();
+            _lastItemCount = all.Count;
+            if (fullMetrics.AutoArrangeEnabled) return false;
+            members = all.FindAll(item =>
+                memberSet.Contains(item.Identity) &&
+                form.Config.IsInInnerRect(item.GridCol(fullMetrics), item.GridRow(fullMetrics)));
+            hostGen = generation;
+            itemCount = all.Count;
+            return true;
+        }
+
+        private void UpdateInputSnapshotSubset(List<DesktopIconInfo> refreshed)
+        {
+            if (_inputSnapshot == null || _inputSnapshot.Count == 0 || refreshed == null || refreshed.Count == 0)
+                return;
+            foreach (var ic in refreshed)
+            {
+                if (ic.Index >= 0 && ic.Index < _inputSnapshot.Count &&
+                    StringComparer.OrdinalIgnoreCase.Equals(_inputSnapshot[ic.Index].Identity, ic.Identity))
+                {
+                    _inputSnapshot[ic.Index] = ic;
+                }
+            }
+        }
+
         public List<DesktopIconInfo> BeginFenceDrag(FenceChromeForm form, out DesktopGridMetrics metrics)
         {
             return BeginFenceMutation(form, true, out metrics);
@@ -1563,6 +1659,7 @@ namespace DeskFences
             IntPtr view = _controller.ListView;
             bool started = false;
             _isMutatingFence = true;
+            _lastDropClean = false;
             try
             {
                 FinishIconAnimationImmediately();
@@ -1570,14 +1667,59 @@ namespace DeskFences
                 // Finish it before inspecting the user's grid settings for a new interaction.
                 _controller.RestoreSnapToGrid();
 
-                // Read fresh live IconBounds / LabelBounds / ScreenBounds (using cached NTFS File IDs
-                // maintained by FileSystemWatcher) so captured icons are always 100% live and bit-exact!
+                var memberSet = new HashSet<string>(form.Config.MemberIconIds, StringComparer.OrdinalIgnoreCase);
+
+                // Fast member-only live path on drag pickup: skips scanning all 50-100 non-member desktop icons
+                // while still reading 100% live ClientPosition / ScreenBounds / IconBounds / LabelBounds / Selected
+                // and verifying each member's ListView index & PIDL identity!
+                if (dragging &&
+                    !_desktopDirty &&
+                    _inputSnapshot != null && _inputSnapshot.Count > 0 &&
+                    _lastGridMetrics.CellWidth > 0 && _lastGridMetrics.CellHeight > 0 &&
+                    form.Config.MemberIconNames.Count == 0 &&
+                    _controller.GetDesktopItemCount() == _inputSnapshot.Count &&
+                    _controller.HasShellItemCount(_inputSnapshot.Count) &&
+                    _controller.GetRawItemSpacing() == _lastRawItemSpacing)
+                {
+                    metrics = _controller.GetLiveStyleMetrics(_lastGridMetrics);
+                    if (metrics.AutoArrangeEnabled)
+                    {
+                        if (!_warnedAutoArrange)
+                        {
+                            _warnedAutoArrange = true;
+                            _trayIcon.ShowBalloonTip(
+                                5000,
+                                "检测到 Windows 开启了“自动排列图标”",
+                                "请在桌面空白处右键 → 查看 → 取消勾选“自动排列图标”，分区才能正常带动图标与自动避让。",
+                                ToolTipIcon.Warning);
+                        }
+                        return null;
+                    }
+
+                    var candidates = _inputSnapshot.FindAll(item => memberSet.Contains(item.Identity));
+                    List<DesktopIconInfo> freshMembers;
+                    if (_controller.TryRefreshIconsLive(candidates, out freshMembers) &&
+                        DesktopReady && _controller.HostGeneration == generation && _controller.ListView == view)
+                    {
+                        UpdateInputSnapshotSubset(freshMembers);
+                        var fastGrid = metrics;
+                        var fastCaptured = freshMembers.FindAll(item =>
+                            form.Config.IsInInnerRect(item.GridCol(fastGrid), item.GridRow(fastGrid)));
+                        _dragDesktop = _inputSnapshot;
+                        _canMoveMembers = true;
+                        started = true;
+                        return fastCaptured;
+                    }
+                }
+
+                // Full live scan fallback (used for resize, dirty desktop, item-count/spacing change, or index shift)
                 var all = _controller.GetAllIcons(false);
                 metrics = _controller.GetGridMetrics(all);
                 if (!_controller.SnapshotComplete || !DesktopReady ||
                     _controller.HostGeneration != generation || _controller.ListView != view) return null;
                 _inputSnapshot = all;
                 _lastGridMetrics = metrics;
+                _lastRawItemSpacing = _controller.GetRawItemSpacing();
                 _lastItemCount = all.Count;
 
                 if (metrics.AutoArrangeEnabled && !_warnedAutoArrange)
@@ -1596,7 +1738,6 @@ namespace DeskFences
                         SaveConfig();
                 }
                 var gridSnapshot = metrics;
-                var memberSet = new HashSet<string>(form.Config.MemberIconIds, StringComparer.OrdinalIgnoreCase);
                 var captured = all.FindAll(item =>
                     memberSet.Contains(item.Identity) &&
                     (!dragging || form.Config.IsInInnerRect(item.GridCol(gridSnapshot), item.GridRow(gridSnapshot))));
@@ -1655,6 +1796,7 @@ namespace DeskFences
             int dy = dRow * grid.CellHeight;
 
             bool committed = true;
+            bool plannedOutsidersFromSnapshot = false;
             var outsiderTracks = new List<IconSlideTrack>();
             var expelledUpdates = new Dictionary<string, Point>(StringComparer.OrdinalIgnoreCase);
 
@@ -1663,7 +1805,6 @@ namespace DeskFences
             {
                 // 1. Plan smooth glide tracks for any conflicting outsiders in the landing zone
                 //    (keeping LVS_EX_SNAPTOGRID suspended so they glide smoothly instead of teleporting!).
-                bool plannedOutsidersFromSnapshot = false;
                 if (clearOutsiders && (dCol != 0 || dRow != 0) && _dragDesktop != null && _controller.HasShellItemCount(_dragDesktop.Count))
                 {
                     bool blocked;
@@ -1773,6 +1914,7 @@ namespace DeskFences
             }
 
             _controller.FlushDesktopPaint(form.Bounds);
+            _lastDropClean = committed && outsiderTracks.Count == 0 && ((dCol == 0 && dRow == 0) || plannedOutsidersFromSnapshot);
             return committed;
         }
 
@@ -1934,7 +2076,10 @@ namespace DeskFences
                 _dragDesktop = null;
                 _canMoveMembers = false;
                 _isMutatingFence = false;
-                _desktopDirty = true;
+                bool cleanDrop = _lastDropClean && !enforce && (pendingTracks == null || pendingTracks.Count == 0);
+                _lastDropClean = false;
+                if (!cleanDrop)
+                    _desktopDirty = true;
                 if (pendingTracks != null && pendingTracks.Count > 0 && CanCommitToCurrentDesktop())
                 {
                     if (!_exiting)
@@ -2035,6 +2180,7 @@ namespace DeskFences
                 _inputSnapshot = icons;
                 var m = _controller.GetGridMetrics(icons);
                 _lastGridMetrics = m;
+                _lastRawItemSpacing = _controller.GetRawItemSpacing();
                 bool configDirty = _membership.Reconcile(Config.Fences, icons, m, _sessionClock.ElapsedMilliseconds);
                 if (configDirty) SaveConfig();
                 if (icons.Count == 0)

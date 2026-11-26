@@ -48,6 +48,7 @@ namespace DeskFences
         public const int LVM_GETITEMRECT = LVM_FIRST + 14;
         public const int LVM_GETITEMPOSITION = LVM_FIRST + 16;
         public const int LVM_GETEDITCONTROL = LVM_FIRST + 24;
+        public const int LVM_GETITEMSTATE = LVM_FIRST + 44;
         public const int LVM_SETITEMPOSITION32 = LVM_FIRST + 49;
         public const int LVM_GETITEMSPACING = LVM_FIRST + 51;
         public const int LVM_SETEXTENDEDLISTVIEWSTYLE = LVM_FIRST + 54;
@@ -589,6 +590,40 @@ namespace DeskFences
         [DllImport("dwmapi.dll")]
         public static extern int DwmFlush();
 
+        [DllImport("winmm.dll")]
+        private static extern uint timeBeginPeriod(uint uPeriod);
+
+        [DllImport("winmm.dll")]
+        private static extern uint timeEndPeriod(uint uPeriod);
+
+        private static readonly object _timerResLock = new object();
+        private static int _highResTimerUsers;
+
+        public static void AcquireHighResTimer()
+        {
+            lock (_timerResLock)
+            {
+                if (_highResTimerUsers == 0)
+                {
+                    try { timeBeginPeriod(1); } catch { }
+                }
+                _highResTimerUsers++;
+            }
+        }
+
+        public static void ReleaseHighResTimer()
+        {
+            lock (_timerResLock)
+            {
+                if (_highResTimerUsers <= 0) return;
+                _highResTimerUsers--;
+                if (_highResTimerUsers == 0)
+                {
+                    try { timeEndPeriod(1); } catch { }
+                }
+            }
+        }
+
         [DllImport("dwmapi.dll")]
         public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
 
@@ -615,6 +650,17 @@ namespace DeskFences
             Rectangle bodyScreenRect,
             List<DesktopIconInfo> members)
         {
+            bool unused;
+            return CaptureNativeListViewIconsTransparent(listViewHwnd, bodyScreenRect, members, out unused);
+        }
+
+        public static Bitmap CaptureNativeListViewIconsTransparent(
+            IntPtr listViewHwnd,
+            Rectangle bodyScreenRect,
+            List<DesktopIconInfo> members,
+            out bool usedTrueAlpha)
+        {
+            usedTrueAlpha = false;
             if (listViewHwnd == IntPtr.Zero || members == null || members.Count == 0 ||
                 bodyScreenRect.Width <= 4 || bodyScreenRect.Height <= 4)
                 return null;
@@ -868,6 +914,7 @@ namespace DeskFences
                     }
 
                     Marshal.Copy(dstBuf, 0, bd.Scan0, dstBuf.Length);
+                    usedTrueAlpha = true;
                     return outBmp;
                 }
 
@@ -1422,6 +1469,95 @@ namespace DeskFences
         {
             if (!HasCurrentHandles()) return -1;
             return (int)NativeMethods.SendMessage(ListView, NativeMethods.LVM_GETITEMCOUNT, IntPtr.Zero, IntPtr.Zero);
+        }
+
+        public int GetRawItemSpacing()
+        {
+            if (!HasCurrentHandles()) return 0;
+            return NativeMethods.SendMessage(ListView, NativeMethods.LVM_GETITEMSPACING, IntPtr.Zero, IntPtr.Zero).ToInt32();
+        }
+
+        public DesktopGridMetrics GetLiveStyleMetrics(DesktopGridMetrics cached)
+        {
+            if (!HasCurrentHandles()) return cached;
+            int style = NativeMethods.GetWindowLong(ListView, NativeMethods.GWL_STYLE);
+            cached.AutoArrangeEnabled = (style & NativeMethods.LVS_AUTOARRANGE) != 0;
+            int exStyle = (int)NativeMethods.SendMessage(ListView, NativeMethods.LVM_GETEXTENDEDLISTVIEWSTYLE, IntPtr.Zero, IntPtr.Zero);
+            cached.SnapToGridEnabled = (exStyle & NativeMethods.LVS_EX_SNAPTOGRID) != 0;
+            return cached;
+        }
+
+        internal bool TryRefreshIconsLive(List<DesktopIconInfo> cachedSubset, out List<DesktopIconInfo> freshSubset)
+        {
+            freshSubset = new List<DesktopIconInfo>();
+            if (!HasCurrentHandles() || cachedSubset == null) return false;
+            if (cachedSubset.Count == 0) return true;
+            if (!_shellView.Connect()) return false;
+
+            int count = GetDesktopItemCount();
+            if (count <= 0) return false;
+
+            int bufBytes = Math.Max(Marshal.SizeOf(typeof(NativeMethods.RECT)), Marshal.SizeOf(typeof(NativeMethods.POINT))) + 16;
+            if (!EnsureRemoteBuffer(bufBytes)) return false;
+
+            IntPtr hProc = _hProc;
+            IntPtr remoteMem = _remoteMem;
+            IntPtr localMem = _localMem;
+            Point lvOrigin = GetListViewScreenOrigin();
+            Func<string, string> resolveId = parsingName =>
+            {
+                string cached;
+                if (_identityCache.TryGetValue(parsingName, out cached)) return cached;
+                string computed = DesktopItemIdentity.ForParsingName(parsingName);
+                _identityCache[parsingName] = computed;
+                return computed;
+            };
+
+            try
+            {
+                freshSubset = new List<DesktopIconInfo>(cachedSubset.Count);
+                foreach (var item in cachedSubset)
+                {
+                    if (item.Index < 0 || item.Index >= count) return false;
+
+                    IntPtr okPos = NativeMethods.SendMessage(ListView, NativeMethods.LVM_GETITEMPOSITION, new IntPtr(item.Index), remoteMem);
+                    if (okPos == IntPtr.Zero) return false;
+                    UIntPtr readBytes;
+                    if (!NativeMethods.ReadProcessMemory(hProc, remoteMem, localMem, (UIntPtr)Marshal.SizeOf(typeof(NativeMethods.POINT)), out readBytes))
+                        return false;
+                    var pt = (NativeMethods.POINT)Marshal.PtrToStructure(localMem, typeof(NativeMethods.POINT));
+                    Point clientPos = new Point(pt.X, pt.Y);
+
+                    if (!_shellView.VerifyItemAt(item.Index, clientPos, item.Identity, resolveId))
+                        return false;
+
+                    var nativeBounds = ReadItemRect(ListView, hProc, remoteMem, localMem, item.Index, NativeMethods.LVIR_BOUNDS, lvOrigin);
+                    var nativeIcon = ReadItemRect(ListView, hProc, remoteMem, localMem, item.Index, NativeMethods.LVIR_ICON, lvOrigin);
+                    var nativeLabel = ReadItemRect(ListView, hProc, remoteMem, localMem, item.Index, NativeMethods.LVIR_LABEL, lvOrigin);
+                    Rectangle screenRect = nativeBounds ?? new Rectangle(pt.X + lvOrigin.X, pt.Y + lvOrigin.Y, 72, 86);
+                    Rectangle iconRect = nativeIcon ?? new Rectangle(screenRect.X + 12, screenRect.Y + 4, 48, 48);
+                    Rectangle labelRect = nativeLabel ?? new Rectangle(screenRect.X, iconRect.Bottom + 2,
+                        screenRect.Width, Math.Max(20, screenRect.Bottom - iconRect.Bottom));
+
+                    int state = (int)NativeMethods.SendMessage(ListView, NativeMethods.LVM_GETITEMSTATE,
+                        new IntPtr(item.Index), new IntPtr(NativeMethods.LVIS_SELECTED));
+
+                    var updated = item;
+                    updated.Selected = (state & NativeMethods.LVIS_SELECTED) != 0;
+                    updated.ClientPosition = clientPos;
+                    updated.ScreenBounds = screenRect;
+                    updated.IconBounds = iconRect;
+                    updated.LabelBounds = labelRect;
+                    updated.EstimatedBounds = !nativeBounds.HasValue || !nativeIcon.HasValue || !nativeLabel.HasValue;
+                    freshSubset.Add(updated);
+                }
+                return true;
+            }
+            catch (COMException)
+            {
+                ResetShellView();
+                return false;
+            }
         }
 
         internal void InvalidateIdentityCache()
