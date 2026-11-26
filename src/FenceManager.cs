@@ -244,6 +244,9 @@ namespace DeskFences
         private DesktopGridMetrics _lastGridMetrics;
         private int _lastRawItemSpacing;
         private bool _lastDropClean;
+        private long _lastSnapshotRefreshMs = -10000;
+        internal bool LastBeginDragUsedFastPath { get; private set; }
+        internal string LastBeginDragNote { get; private set; }
         private long _lastFullScanMs = -10000;
         private int _lastItemCount = -1;
         private bool _fencesHiddenByUser;
@@ -999,6 +1002,7 @@ namespace DeskFences
             if (!relevant) return;
 
             _desktopDirty = true;
+            _lastSnapshotRefreshMs = -10000;
             EnforceAllRules(true, true);
         }
 
@@ -1040,6 +1044,7 @@ namespace DeskFences
                     {
                         _controller.InvalidateIdentityCache();
                         _desktopDirty = true;
+                        _lastSnapshotRefreshMs = -10000;
                         foreach (var form in _forms.Values) form.ClearDragPreWarm();
                         TriggerSubFrameBurstCheck();
                     }));
@@ -1591,11 +1596,13 @@ namespace DeskFences
             FenceChromeForm form,
             out List<DesktopIconInfo> members,
             out int hostGen,
-            out int itemCount)
+            out int itemCount,
+            out bool usedFastPath)
         {
             members = null;
             hostGen = _controller.HostGeneration;
             itemCount = -1;
+            usedFastPath = false;
             if (!DesktopReady || IsBusy || form == null || form.Config.MemberIconIds.Count == 0)
                 return false;
 
@@ -1604,7 +1611,8 @@ namespace DeskFences
             var memberSet = new HashSet<string>(form.Config.MemberIconIds, StringComparer.OrdinalIgnoreCase);
 
             int liveCount = _controller.GetDesktopItemCount();
-            if (!_desktopDirty &&
+            bool snapshotFresh = !_desktopDirty || (_sessionClock.ElapsedMilliseconds - _lastSnapshotRefreshMs) <= 400;
+            if (snapshotFresh &&
                 _inputSnapshot != null && _inputSnapshot.Count > 0 &&
                 _lastGridMetrics.CellWidth > 0 && _lastGridMetrics.CellHeight > 0 &&
                 form.Config.MemberIconNames.Count == 0 &&
@@ -1623,6 +1631,7 @@ namespace DeskFences
                     members = fresh.FindAll(item => form.Config.IsInInnerRect(item.GridCol(metrics), item.GridRow(metrics)));
                     hostGen = generation;
                     itemCount = liveCount;
+                    usedFastPath = true;
                     return true;
                 }
             }
@@ -1637,6 +1646,7 @@ namespace DeskFences
             _lastGridMetrics = fullMetrics;
             _lastRawItemSpacing = _controller.GetRawItemSpacing();
             _lastItemCount = all.Count;
+            _lastSnapshotRefreshMs = _sessionClock.ElapsedMilliseconds;
             if (fullMetrics.AutoArrangeEnabled) return false;
             members = all.FindAll(item =>
                 memberSet.Contains(item.Identity) &&
@@ -1682,47 +1692,56 @@ namespace DeskFences
                 _controller.RestoreSnapToGrid();
 
                 var memberSet = new HashSet<string>(form.Config.MemberIconIds, StringComparer.OrdinalIgnoreCase);
+                LastBeginDragUsedFastPath = false;
+                LastBeginDragNote = "full";
 
                 // Fast member-only live path on drag pickup: skips scanning all 50-100 non-member desktop icons
                 // while still reading 100% live ClientPosition / ScreenBounds / IconBounds / LabelBounds / Selected
                 // and verifying each member's ListView index & PIDL identity!
-                if (dragging &&
-                    !_desktopDirty &&
-                    _inputSnapshot != null && _inputSnapshot.Count > 0 &&
-                    _lastGridMetrics.CellWidth > 0 && _lastGridMetrics.CellHeight > 0 &&
-                    form.Config.MemberIconNames.Count == 0 &&
-                    _controller.GetDesktopItemCount() == _inputSnapshot.Count &&
-                    _controller.HasShellItemCount(_inputSnapshot.Count) &&
-                    _controller.GetRawItemSpacing() == _lastRawItemSpacing)
+                bool snapshotFresh = !_desktopDirty || (_sessionClock.ElapsedMilliseconds - _lastSnapshotRefreshMs) <= 400;
+                if (dragging)
                 {
-                    metrics = _controller.GetLiveStyleMetrics(_lastGridMetrics);
-                    if (metrics.AutoArrangeEnabled)
+                    if (!snapshotFresh) LastBeginDragNote = "dirty";
+                    else if (_inputSnapshot == null || _inputSnapshot.Count == 0) LastBeginDragNote = "noSnap";
+                    else if (_lastGridMetrics.CellWidth <= 0 || _lastGridMetrics.CellHeight <= 0) LastBeginDragNote = "noGrid";
+                    else if (form.Config.MemberIconNames.Count != 0) LastBeginDragNote = "legacyNames";
+                    else if (_controller.GetDesktopItemCount() != _inputSnapshot.Count) LastBeginDragNote = "lvCount";
+                    else if (!_controller.HasShellItemCount(_inputSnapshot.Count)) LastBeginDragNote = "shellCount";
+                    else if (_controller.GetRawItemSpacing() != _lastRawItemSpacing) LastBeginDragNote = "spacing";
+                    else
                     {
-                        if (!_warnedAutoArrange)
+                        metrics = _controller.GetLiveStyleMetrics(_lastGridMetrics);
+                        if (metrics.AutoArrangeEnabled)
                         {
-                            _warnedAutoArrange = true;
-                            _trayIcon.ShowBalloonTip(
-                                5000,
-                                "检测到 Windows 开启了“自动排列图标”",
-                                "请在桌面空白处右键 → 查看 → 取消勾选“自动排列图标”，分区才能正常带动图标与自动避让。",
-                                ToolTipIcon.Warning);
+                            if (!_warnedAutoArrange)
+                            {
+                                _warnedAutoArrange = true;
+                                _trayIcon.ShowBalloonTip(
+                                    5000,
+                                    "检测到 Windows 开启了“自动排列图标”",
+                                    "请在桌面空白处右键 → 查看 → 取消勾选“自动排列图标”，分区才能正常带动图标与自动避让。",
+                                    ToolTipIcon.Warning);
+                            }
+                            return null;
                         }
-                        return null;
-                    }
 
-                    var candidates = _inputSnapshot.FindAll(item => memberSet.Contains(item.Identity));
-                    List<DesktopIconInfo> freshMembers;
-                    if (_controller.TryRefreshIconsLive(candidates, out freshMembers) &&
-                        DesktopReady && _controller.HostGeneration == generation && _controller.ListView == view)
-                    {
-                        UpdateInputSnapshotSubset(freshMembers);
-                        var fastGrid = metrics;
-                        var fastCaptured = freshMembers.FindAll(item =>
-                            form.Config.IsInInnerRect(item.GridCol(fastGrid), item.GridRow(fastGrid)));
-                        _dragDesktop = _inputSnapshot;
-                        _canMoveMembers = true;
-                        started = true;
-                        return fastCaptured;
+                        var candidates = _inputSnapshot.FindAll(item => memberSet.Contains(item.Identity));
+                        List<DesktopIconInfo> freshMembers;
+                        if (_controller.TryRefreshIconsLive(candidates, out freshMembers) &&
+                            DesktopReady && _controller.HostGeneration == generation && _controller.ListView == view)
+                        {
+                            UpdateInputSnapshotSubset(freshMembers);
+                            var fastGrid = metrics;
+                            var fastCaptured = freshMembers.FindAll(item =>
+                                form.Config.IsInInnerRect(item.GridCol(fastGrid), item.GridRow(fastGrid)));
+                            _dragDesktop = _inputSnapshot;
+                            _canMoveMembers = true;
+                            LastBeginDragUsedFastPath = true;
+                            LastBeginDragNote = "fast";
+                            started = true;
+                            return fastCaptured;
+                        }
+                        LastBeginDragNote = "verifyFail";
                     }
                 }
 
@@ -1735,6 +1754,7 @@ namespace DeskFences
                 _lastGridMetrics = metrics;
                 _lastRawItemSpacing = _controller.GetRawItemSpacing();
                 _lastItemCount = all.Count;
+                _lastSnapshotRefreshMs = _sessionClock.ElapsedMilliseconds;
 
                 if (metrics.AutoArrangeEnabled && !_warnedAutoArrange)
                 {
@@ -1781,10 +1801,22 @@ namespace DeskFences
 
         internal bool ParkDragMembers(List<DesktopIconInfo> members, bool snapEnabled, Rectangle dirtyScreenRect)
         {
+            DesktopIconController.ParkTiming unused;
+            return ParkDragMembers(members, snapEnabled, dirtyScreenRect, out unused);
+        }
+
+        internal bool ParkDragMembers(List<DesktopIconInfo> members, bool snapEnabled, Rectangle dirtyScreenRect,
+            out DesktopIconController.ParkTiming timing)
+        {
+            timing = new DesktopIconController.ParkTiming();
             if (!CanCommitToCurrentDesktop() || !_isMutatingFence || members == null || members.Count == 0) return false;
-            bool parked = _controller.ParkIconsOffscreen(members, snapEnabled);
+            bool parked = _controller.ParkIconsOffscreen(members, snapEnabled, out timing);
             if (parked)
+            {
+                var sw = Stopwatch.StartNew();
                 _controller.FlushDesktopPaint(dirtyScreenRect);
+                timing.FlushPaintMs = sw.Elapsed.TotalMilliseconds;
+            }
             return parked;
         }
 

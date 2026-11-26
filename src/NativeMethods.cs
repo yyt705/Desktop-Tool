@@ -645,22 +645,29 @@ namespace DeskFences
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, IntPtr lpBuffer, UIntPtr nSize, out UIntPtr lpNumberOfBytesWritten);
 
-        public static Bitmap CaptureNativeListViewIconsTransparent(
-            IntPtr listViewHwnd,
-            Rectangle bodyScreenRect,
-            List<DesktopIconInfo> members)
+        internal struct CaptureDiag
         {
-            bool unused;
-            return CaptureNativeListViewIconsTransparent(listViewHwnd, bodyScreenRect, members, out unused);
+            public bool UsedTrueIconAlpha;
+            public bool UsedTrueLabelAlpha;
+            public bool UsedFallbackFullContent;
         }
 
         public static Bitmap CaptureNativeListViewIconsTransparent(
             IntPtr listViewHwnd,
             Rectangle bodyScreenRect,
-            List<DesktopIconInfo> members,
-            out bool usedTrueAlpha)
+            List<DesktopIconInfo> members)
         {
-            usedTrueAlpha = false;
+            CaptureDiag unused;
+            return CaptureNativeListViewIconsTransparent(listViewHwnd, bodyScreenRect, members, out unused);
+        }
+
+        internal static Bitmap CaptureNativeListViewIconsTransparent(
+            IntPtr listViewHwnd,
+            Rectangle bodyScreenRect,
+            List<DesktopIconInfo> members,
+            out CaptureDiag diag)
+        {
+            diag = new CaptureDiag();
             if (listViewHwnd == IntPtr.Zero || members == null || members.Count == 0 ||
                 bodyScreenRect.Width <= 4 || bodyScreenRect.Height <= 4)
                 return null;
@@ -815,6 +822,7 @@ namespace DeskFences
             }
 
             // Fallback to PW_RENDERFULLCONTENT only if PrintWindow(0) truly produced no icon alpha
+            bool usedFallback = false;
             if (buf == null || !hasTrueIconAlpha)
             {
                 byte[] fullBuf = CaptureListViewOverSolid(listViewHwnd, lvW, lvH, cropRect, 0, PW_RENDERFULLCONTENT);
@@ -823,10 +831,14 @@ namespace DeskFences
                     buf = fullBuf;
                     hasTrueIconAlpha = false;
                     hasTrueLabelAlpha = false;
+                    usedFallback = true;
                     bgB = bgG = bgR = 0;
                 }
             }
             if (buf == null) return null;
+            diag.UsedTrueIconAlpha = hasTrueIconAlpha;
+            diag.UsedTrueLabelAlpha = hasTrueLabelAlpha;
+            diag.UsedFallbackFullContent = usedFallback;
 
             var outBmp = new Bitmap(outW, outH, System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
             var bd = outBmp.LockBits(new Rectangle(0, 0, outW, outH),
@@ -914,7 +926,6 @@ namespace DeskFences
                     }
 
                     Marshal.Copy(dstBuf, 0, bd.Scan0, dstBuf.Length);
-                    usedTrueAlpha = true;
                     return outBmp;
                 }
 
@@ -2079,10 +2090,26 @@ namespace DeskFences
             return true;
         }
 
+        internal struct ParkTiming
+        {
+            public double SuspendSnapMs;
+            public double MoveMs;
+            public double VerifyMs;
+            public double FlushPaintMs;
+        }
+
         public bool ParkIconsOffscreen(List<DesktopIconInfo> members, bool snapEnabled = true)
         {
+            ParkTiming unused;
+            return ParkIconsOffscreen(members, snapEnabled, out unused);
+        }
+
+        internal bool ParkIconsOffscreen(List<DesktopIconInfo> members, bool snapEnabled, out ParkTiming timing)
+        {
+            timing = new ParkTiming();
             if (members == null || members.Count == 0) return true;
             if (!HasCurrentHandles()) return false;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             Point lvOrigin = GetListViewScreenOrigin();
             Rectangle vs = System.Windows.Forms.SystemInformation.VirtualScreen;
             Rectangle paddedVs = Rectangle.Inflate(vs, 200, 200);
@@ -2097,6 +2124,7 @@ namespace DeskFences
                 // CRITICAL (ComCtl v6): Suspend LVS_EX_SNAPTOGRID BEFORE moving offscreen!
                 // With SnapToGrid ON, ComCtl v6 clamps negative offscreen coords directly onto
                 // the visible top-left desktop cells AND pushes existing top-left icons aside!
+                double t0 = sw.Elapsed.TotalMilliseconds;
                 if (snapEnabled || liveSnap)
                 {
                     if (!_restoreSnapOnRelease)
@@ -2105,15 +2133,16 @@ namespace DeskFences
                         suspendedHere = _restoreSnapOnRelease;
                     }
                 }
+                timing.SuspendSnapMs = sw.Elapsed.TotalMilliseconds - t0;
 
                 int negX = Math.Min(-5000, vs.Left - lvOrigin.X - 5000);
                 int negY = Math.Min(-5000, vs.Top - lvOrigin.Y - 5000);
-                if (TryParkAtBase(members, negX, negY, -120, lvOrigin, paddedVs))
+                if (TryParkAtBase(members, negX, negY, -120, lvOrigin, paddedVs, sw, ref timing))
                     return true;
 
                 int posX = Math.Max(20000, vs.Right - lvOrigin.X + 5000);
                 int posY = Math.Max(20000, vs.Bottom - lvOrigin.Y + 5000);
-                if (TryParkAtBase(members, posX, posY, 120, lvOrigin, paddedVs))
+                if (TryParkAtBase(members, posX, posY, 120, lvOrigin, paddedVs, sw, ref timing))
                     return true;
 
                 // Explorer refused offscreen coords: restore original positions BEFORE re-enabling
@@ -2131,21 +2160,32 @@ namespace DeskFences
             }
         }
 
-        private bool TryParkAtBase(List<DesktopIconInfo> members, int baseX, int baseY, int stepX, Point lvOrigin, Rectangle paddedVirtualScreen)
+        private bool TryParkAtBase(List<DesktopIconInfo> members, int baseX, int baseY, int stepX, Point lvOrigin, Rectangle paddedVirtualScreen,
+            System.Diagnostics.Stopwatch sw, ref ParkTiming timing)
         {
+            double tMove = sw.Elapsed.TotalMilliseconds;
             var moves = new List<KeyValuePair<int, Point>>(members.Count);
             for (int i = 0; i < members.Count; i++)
                 moves.Add(new KeyValuePair<int, Point>(members[i].Index, new Point(baseX + i * stepX, baseY)));
             MoveIconsDirectByIndex(moves);
+            timing.MoveMs += sw.Elapsed.TotalMilliseconds - tMove;
 
+            double tVer = sw.Elapsed.TotalMilliseconds;
             foreach (var m in members)
             {
                 Point pos;
                 if (!TryGetItemClientPosition(m.Index, out pos) && !TryGetLiveIconPosition(m.Identity, out pos))
+                {
+                    timing.VerifyMs += sw.Elapsed.TotalMilliseconds - tVer;
                     return false;
+                }
                 if (paddedVirtualScreen.Contains(pos.X + lvOrigin.X, pos.Y + lvOrigin.Y))
+                {
+                    timing.VerifyMs += sw.Elapsed.TotalMilliseconds - tVer;
                     return false;
+                }
             }
+            timing.VerifyMs += sw.Elapsed.TotalMilliseconds - tVer;
             return true;
         }
 
