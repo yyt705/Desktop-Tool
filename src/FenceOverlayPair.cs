@@ -638,7 +638,7 @@ namespace DeskFences
             _animTimer = new Timer { Interval = 8 };
             _animTimer.Tick += OnAnimTimerTick;
 
-            _hoverWarmTimer = new Timer { Interval = 80 };
+            _hoverWarmTimer = new Timer { Interval = 50 };
             _hoverWarmTimer.Tick += OnHoverWarmTimerTick;
         }
 
@@ -1036,10 +1036,10 @@ namespace DeskFences
                    _dragPreWarm.FenceBounds == Bounds &&
                    _dragPreWarm.HeaderHeight == HeaderHeight &&
                    _dragPreWarm.HostGeneration == _manager.CurrentHostGeneration &&
-                   (_manager.SessionElapsedMs - _dragPreWarm.CapturedAtMs) <= 1200;
+                   (_manager.SessionElapsedMs - _dragPreWarm.CapturedAtMs) <= 10000;
         }
 
-        private void ScheduleHoverPreWarm()
+        private void ScheduleHoverPreWarm(int delayMs = 50)
         {
             if (IsDisposed || !IsHandleCreated || !Visible || _manager.Config.Locked ||
                 Config.MemberIconIds.Count == 0 || _manager.IsBusy || IsInteracting)
@@ -1047,7 +1047,25 @@ namespace DeskFences
             if (_manager.SessionElapsedMs < _hoverWarmCooldownUntilMs) return;
             if (HasFreshPreWarmForCurrentBounds()) return;
             if (!_hoverWarmTimer.Enabled)
+            {
+                _hoverWarmTimer.Interval = delayMs;
                 _hoverWarmTimer.Start();
+            }
+        }
+
+        private void SchedulePostDropPreWarm()
+        {
+            if (IsDisposed || !IsHandleCreated || !Visible || _manager.Config.Locked ||
+                Config.MemberIconIds.Count == 0)
+                return;
+            if (_manager.SessionElapsedMs < _hoverWarmCooldownUntilMs) return;
+            Point local = PointToClient(Cursor.Position);
+            if (local.X < 0 || local.X >= Width || local.Y < 0 || local.Y > HeaderHeight ||
+                GetMenuButtonRect().Contains(local) || HitTestResizeEdge(local) != ResizeEdge.None)
+                return;
+            if (_hoverWarmTimer.Enabled) _hoverWarmTimer.Stop();
+            _hoverWarmTimer.Interval = 220;
+            _hoverWarmTimer.Start();
         }
 
         private void OnHoverWarmTimerTick(object sender, EventArgs e)
@@ -1139,7 +1157,7 @@ namespace DeskFences
             if (pre.Layer.Width != bodyScreenRect.Width || pre.Layer.Height != bodyScreenRect.Height) { _lastPreWarmRejectReason = "size"; return false; }
             if (pre.HostGeneration != _manager.CurrentHostGeneration) { _lastPreWarmRejectReason = "gen"; return false; }
             if (pre.DesktopItemCount != _manager.GetDesktopItemCount()) { _lastPreWarmRejectReason = "count"; return false; }
-            if ((_manager.SessionElapsedMs - pre.CapturedAtMs) > 1500) { _lastPreWarmRejectReason = "age"; return false; }
+            if ((_manager.SessionElapsedMs - pre.CapturedAtMs) > 10000) { _lastPreWarmRejectReason = "age"; return false; }
             if (pre.Members == null || pre.Members.Count != _capturedMembers.Count) { _lastPreWarmRejectReason = "memCount"; return false; }
             if (pre.AnySelected && pre.DesktopWasForeground != _manager.IsDesktopListViewForeground()) { _lastPreWarmRejectReason = "fg"; return false; }
 
@@ -2276,6 +2294,8 @@ namespace DeskFences
             {
                 try { _manager.EndFenceMutation(this, false, moved); }
                 finally { _completingInteraction = false; }
+                if (!Disposing && !IsDisposed)
+                    SchedulePostDropPreWarm();
             }
         }
 

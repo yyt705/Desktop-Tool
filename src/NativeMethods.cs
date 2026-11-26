@@ -81,6 +81,7 @@ namespace DeskFences
 
         // Region ops
         public const int RGN_AND = 1;
+        public const int RGN_OR = 2;
         public const int RGN_DIFF = 4;
 
         // DWM Rounded Corners
@@ -445,12 +446,16 @@ namespace DeskFences
         public static extern bool InvalidateRect(IntPtr hWnd, ref RECT lpRect, bool bErase);
 
         [DllImport("user32.dll")]
+        public static extern bool ValidateRect(IntPtr hWnd, IntPtr lpRect);
+
+        [DllImport("user32.dll")]
         public static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
 
         [DllImport("shcore.dll")]
         private static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
 
         public const uint RDW_INVALIDATE = 0x0001;
+        public const uint RDW_ERASE = 0x0004;
         public const uint RDW_ALLCHILDREN = 0x0080;
         public const uint RDW_UPDATENOW = 0x0100;
 
@@ -2205,6 +2210,67 @@ namespace DeskFences
                 NativeMethods.InvalidateRect(ListView, ref rc, true);
             }
             catch { }
+        }
+
+        /// <summary>
+        /// Clears any full-screen dirty region left over by WM_SETREDRAW / LVM_SETEXTENDEDLISTVIEWSTYLE
+        /// and synchronously repaints ONLY the tight bounding rectangles of the parked member icons.
+        /// Keeps old icon positions 100% erased before movement while minimizing Explorer repaint work.
+        /// </summary>
+        public void FlushDesktopMemberRects(List<DesktopIconInfo> members, Rectangle fallbackScreenRect)
+        {
+            if (!HasCurrentHandles()) return;
+            IntPtr hRgn = IntPtr.Zero;
+            try
+            {
+                Point lvOrigin = GetListViewScreenOrigin();
+                NativeMethods.ValidateRect(ListView, IntPtr.Zero);
+
+                if (members != null && members.Count > 0)
+                {
+                    foreach (var m in members)
+                    {
+                        Rectangle u = Rectangle.Union(m.ScreenBounds, Rectangle.Union(m.IconBounds, m.LabelBounds));
+                        if (u.Width <= 0 || u.Height <= 0) continue;
+                        int l = u.Left - lvOrigin.X - 10;
+                        int t = u.Top - lvOrigin.Y - 10;
+                        int r = u.Right - lvOrigin.X + 10;
+                        int b = u.Bottom - lvOrigin.Y + 10;
+                        IntPtr itemRgn = NativeMethods.CreateRectRgn(l, t, r, b);
+                        if (itemRgn == IntPtr.Zero) continue;
+                        if (hRgn == IntPtr.Zero)
+                        {
+                            hRgn = itemRgn;
+                        }
+                        else
+                        {
+                            NativeMethods.CombineRgn(hRgn, hRgn, itemRgn, NativeMethods.RGN_OR);
+                            NativeMethods.DeleteObject(itemRgn);
+                        }
+                    }
+                }
+
+                if (hRgn == IntPtr.Zero)
+                {
+                    hRgn = NativeMethods.CreateRectRgn(
+                        fallbackScreenRect.Left - lvOrigin.X - 8,
+                        fallbackScreenRect.Top - lvOrigin.Y - 8,
+                        fallbackScreenRect.Right - lvOrigin.X + 8,
+                        fallbackScreenRect.Bottom - lvOrigin.Y + 8);
+                }
+
+                if (hRgn != IntPtr.Zero)
+                {
+                    NativeMethods.RedrawWindow(ListView, IntPtr.Zero, hRgn,
+                        NativeMethods.RDW_INVALIDATE | NativeMethods.RDW_ERASE | NativeMethods.RDW_UPDATENOW);
+                }
+            }
+            catch { }
+            finally
+            {
+                if (hRgn != IntPtr.Zero)
+                    NativeMethods.DeleteObject(hRgn);
+            }
         }
 
         public void FlushDesktopPaint(Rectangle? dirtyScreenRect = null, IEnumerable<Rectangle> extraDirtyScreenRects = null)

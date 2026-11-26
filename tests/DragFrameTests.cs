@@ -408,6 +408,12 @@ namespace DeskFences
                             "Pre-warm snapshot MUST be rejected when any member's Selected state changed!");
 
                         preWarmType.GetField("Members").SetValue(pre, new List<DesktopIconInfo>(liveMembers));
+                        preWarmType.GetField("CapturedAtMs").SetValue(pre, f.Manager.SessionElapsedMs - 15000);
+                        object[] argsExpired = new object[] { pre, bodyRect, null };
+                        Check(!(bool)adoptMethod.Invoke(moving, argsExpired) && argsExpired[2] == null,
+                            "Pre-warm snapshot MUST be rejected when older than 10s!");
+
+                        preWarmType.GetField("CapturedAtMs").SetValue(pre, f.Manager.SessionElapsedMs);
                         object[] argsFresh = new object[] { pre, bodyRect, null };
                         Check((bool)adoptMethod.Invoke(moving, argsFresh) && object.ReferenceEquals(argsFresh[2], fakeBmp),
                             "Pre-warm snapshot MUST be adopted when every member's live bounds & state match!");

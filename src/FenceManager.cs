@@ -1814,7 +1814,7 @@ namespace DeskFences
             if (parked)
             {
                 var sw = Stopwatch.StartNew();
-                _controller.FlushDesktopPaint(dirtyScreenRect);
+                _controller.FlushDesktopMemberRects(members, dirtyScreenRect);
                 timing.FlushPaintMs = sw.Elapsed.TotalMilliseconds;
             }
             return parked;
