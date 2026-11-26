@@ -230,6 +230,7 @@ namespace DeskFences
         private readonly Timer _watchTimer;
         private readonly Timer _burstWatchTimer;
         private readonly Timer _iconAnimTimer;
+        private readonly Timer _displayChangeTimer;
         private readonly Stopwatch _iconAnimWatch = new Stopwatch();
         private readonly Stopwatch _sessionClock = Stopwatch.StartNew();
         private readonly Control _uiInvoker;
@@ -313,6 +314,10 @@ namespace DeskFences
         private bool _layoutPending;
         private bool _rebindingDesktop;
         private bool _deferredDisplayChange;
+        private bool _displaySwitchPending;
+        private string _lastAppliedProfileKey;
+        private long _postSwitchGuardUntilMs = -1;
+        private Dictionary<string, Point> _expectedSwitchCells;
         private bool _exiting;
         private bool _exitAfterInteraction;
         private long _nextLayerCheckMs;
@@ -325,6 +330,7 @@ namespace DeskFences
             public Point LastSentPos;
         }
 
+        private ToolStripMenuItem _miProfileInfo;
         private ToolStripMenuItem _miLock;
         private ToolStripMenuItem _miHideAll;
         private ToolStripMenuItem _miStartup;
@@ -350,6 +356,9 @@ namespace DeskFences
 
             _burstWatchTimer = new Timer { Interval = 8 };
             _burstWatchTimer.Tick += OnBurstWatchTimerTick;
+
+            _displayChangeTimer = new Timer { Interval = 700 };
+            _displayChangeTimer.Tick += OnDisplayChangeTimerTick;
 
             _watchTimer = new Timer { Interval = 350 };
             _watchTimer.Tick += OnWatchTimerTick;
@@ -1176,30 +1185,236 @@ namespace DeskFences
                 bool rebuild = hostChanged || missingWindow || _layoutPending;
                 _layoutPending = false;
                 var metrics = _controller.GetGridMetrics(icons);
+                bool restoredByProfile = false;
                 if (_needsInitialFence)
                 {
                     CreateDefaultInitialFence(metrics);
                     _needsInitialFence = false;
+                    DisplayProfileManager.CaptureCurrentProfile(Config, MonitorGrid.GetAreas(metrics), icons, metrics, true);
+                    _lastAppliedProfileKey = Config.ActiveProfileKey;
+                    SaveConfig();
+                    UpdateTrayStates();
+                }
+                else
+                {
+                    restoredByProfile = ApplyDisplayProfileOnHostRefresh(icons, metrics, displayChanged, rebuild);
+                }
+                if (_winEventHook == IntPtr.Zero) InstallDesktopWinEventHook();
+                if (restoredByProfile) return;
+            }
+            finally { _rebindingDesktop = false; }
+            InitializeKnownIconsAndEnforce();
+        }
+
+        private bool ApplyDisplayProfileOnHostRefresh(
+            List<DesktopIconInfo> icons,
+            DesktopGridMetrics metrics,
+            bool displayChanged,
+            bool rebuild)
+        {
+            Rectangle[] areas = MonitorGrid.GetAreas(metrics);
+            float dpi = Config.Fences.Count > 0
+                ? MonitorGrid.GetDpiScaleForCell(Config.Fences[0].OuterCol, Config.Fences[0].OuterRow, metrics)
+                : NativeMethods.GetWindowDpiScale(IntPtr.Zero);
+
+            bool hasSavedProfiles = Config.DisplayProfiles != null && Config.DisplayProfiles.Count > 0;
+            bool shouldRestoreIcons = false;
+            DisplayProfile activeProfile = null;
+
+            if (!hasSavedProfiles)
+            {
+                // First run after upgrading from v1.0.x: keep current desktop layout untouched and capture it as baseline profile.
+                ResolveExistingOverlaps(metrics);
+                DisplayProfileManager.CaptureCurrentProfile(Config, areas, icons, metrics, true);
+                _lastAppliedProfileKey = Config.ActiveProfileKey;
+                SaveConfig();
+            }
+            else
+            {
+                bool createdNew;
+                activeProfile = DisplayProfileManager.SwitchOrAdaptProfile(Config, areas, metrics, dpi, out createdNew);
+                if (activeProfile != null)
+                {
+                    bool topologyChanged = displayChanged ||
+                        !string.Equals(activeProfile.Key, _lastAppliedProfileKey, StringComparison.OrdinalIgnoreCase);
+                    _lastAppliedProfileKey = activeProfile.Key;
+                    shouldRestoreIcons = topologyChanged;
+                    SaveConfig();
                 }
                 else
                 {
                     ResolveExistingOverlaps(metrics);
-                    if (rebuild)
-                        RebuildAllForms(metrics);
-                    else
+                }
+            }
+
+            if (rebuild)
+                RebuildAllForms(metrics);
+            else
+            {
+                foreach (var form in _forms.Values)
+                {
+                    form.UpdateDpiScale();
+                    form.AttachToDesktopLayer();
+                    form.SyncBoundsFromGrid(metrics);
+                }
+            }
+            UpdateTrayStates();
+
+            if (shouldRestoreIcons && activeProfile != null && !metrics.AutoArrangeEnabled)
+            {
+                RestoreIconsForProfileAtomic(activeProfile, icons, areas, metrics, true);
+                return true;
+            }
+            return false;
+        }
+
+        internal void RestoreIconsForProfileAtomic(
+            DisplayProfile profile,
+            List<DesktopIconInfo> icons,
+            Rectangle[] areas,
+            DesktopGridMetrics metrics,
+            bool armGuard)
+        {
+            Dictionary<string, Point> targetCells;
+            var moves = DisplayProfileManager.PlanIconRestoration(Config, profile, icons, areas, metrics, out targetCells);
+
+            if (moves.Count > 0 && CanCommitToCurrentDesktop())
+            {
+                _controller.SetListViewRedraw(false);
+                try
+                {
+                    if (metrics.SnapToGridEnabled)
+                        _controller.SuspendSnapToGrid();
+                    _controller.MoveIconsBatch(moves);
+                    _controller.RestoreSnapToGrid();
+                }
+                finally
+                {
+                    _controller.SetListViewRedraw(true);
+                }
+                _controller.FlushDesktopPaint();
+            }
+
+            _knownIconCells.Clear();
+            foreach (var kv in targetCells)
+                _knownIconCells[kv.Key] = kv.Value;
+
+            // Refresh snapshot after atomic batch move so immediate drags see updated coordinates
+            var postIcons = _controller.GetAllIcons(false);
+            if (_controller.SnapshotComplete)
+            {
+                _inputSnapshot = postIcons;
+                _lastItemCount = postIcons.Count;
+            }
+            else
+            {
+                _inputSnapshot = icons;
+                _lastItemCount = icons.Count;
+            }
+            _lastGridMetrics = metrics;
+            _lastRawItemSpacing = _controller.GetRawItemSpacing();
+            _lastSnapshotRefreshMs = _sessionClock != null ? _sessionClock.ElapsedMilliseconds : 0;
+            _lastFullScanMs = _lastSnapshotRefreshMs;
+            _desktopDirty = false;
+
+            if (armGuard && _sessionClock != null && targetCells.Count > 0)
+            {
+                _expectedSwitchCells = new Dictionary<string, Point>(targetCells, StringComparer.OrdinalIgnoreCase);
+                _postSwitchGuardUntilMs = _sessionClock.ElapsedMilliseconds + 2500;
+            }
+
+            if (SyncActiveProfileFromFinalCells(_inputSnapshot, targetCells, metrics, false) && !_exiting)
+                SaveConfig();
+        }
+
+        private void ScheduleDebouncedDisplaySwitch()
+        {
+            if (_exiting || _displayChangeTimer == null) return;
+            _displaySwitchPending = true;
+            _displayChangeTimer.Stop();
+            _displayChangeTimer.Start();
+        }
+
+        private void OnDisplayChangeTimerTick(object sender, EventArgs e)
+        {
+            if (_displayChangeTimer != null) _displayChangeTimer.Stop();
+            _displaySwitchPending = false;
+            if (_exiting) return;
+            RefreshDesktopHostHandles(true);
+        }
+
+        public void ReapplyCurrentDisplayProfile()
+        {
+            if (!PrepareFenceInteraction()) return;
+            var icons = _controller.GetAllIcons(false);
+            if (!_controller.SnapshotComplete) return;
+            var metrics = _controller.GetGridMetrics(icons);
+            if (metrics.AutoArrangeEnabled) return;
+            Rectangle[] areas = MonitorGrid.GetAreas(metrics);
+            float dpi = Config.Fences.Count > 0
+                ? MonitorGrid.GetDpiScaleForCell(Config.Fences[0].OuterCol, Config.Fences[0].OuterRow, metrics)
+                : NativeMethods.GetWindowDpiScale(IntPtr.Zero);
+            bool createdNew;
+            var profile = DisplayProfileManager.SwitchOrAdaptProfile(Config, areas, metrics, dpi, out createdNew);
+            if (profile == null) return;
+            _lastAppliedProfileKey = profile.Key;
+            foreach (var form in _forms.Values)
+            {
+                form.UpdateDpiScale();
+                form.SyncBoundsFromGrid(metrics);
+            }
+            RestoreIconsForProfileAtomic(profile, icons, areas, metrics, true);
+            UpdateTrayStates();
+            SaveConfig();
+        }
+
+        private bool SyncActiveProfileFromFinalCells(
+            IEnumerable<DesktopIconInfo> icons,
+            Dictionary<string, Point> finalCells,
+            DesktopGridMetrics metrics,
+            bool markUserEdited)
+        {
+            if (Config == null || _displaySwitchPending || metrics.CellWidth <= 0 || metrics.CellHeight <= 0)
+                return false;
+            Rectangle[] areas = MonitorGrid.GetAreas(metrics);
+            if (areas.Length == 0) return false;
+            // Construct lightweight projected icon list using post-move finalCells so animated/moved icons record final targets
+            List<DesktopIconInfo> projected = null;
+            if (icons != null && finalCells != null)
+            {
+                projected = new List<DesktopIconInfo>();
+                foreach (var ic in icons)
+                {
+                    var copy = ic;
+                    Point dst;
+                    if (!string.IsNullOrEmpty(ic.Identity) && finalCells.TryGetValue(ic.Identity, out dst))
                     {
-                        foreach (var form in _forms.Values)
+                        int curCol = ic.GridCol(metrics);
+                        int curRow = ic.GridRow(metrics);
+                        int dx = (dst.X - curCol) * metrics.CellWidth;
+                        int dy = (dst.Y - curRow) * metrics.CellHeight;
+                        if (dx != 0 || dy != 0)
                         {
-                            form.UpdateDpiScale();
-                            form.AttachToDesktopLayer();
-                            form.SyncBoundsFromGrid(metrics);
+                            copy.ClientPosition.Offset(dx, dy);
+                            copy.ScreenBounds.Offset(dx, dy);
+                            copy.IconBounds.Offset(dx, dy);
+                            copy.LabelBounds.Offset(dx, dy);
                         }
                     }
+                    projected.Add(copy);
                 }
-                if (_winEventHook == IntPtr.Zero) InstallDesktopWinEventHook();
             }
-            finally { _rebindingDesktop = false; }
-            InitializeKnownIconsAndEnforce();
+            bool changed = DisplayProfileManager.CaptureCurrentProfile(Config, areas, projected ?? icons, metrics, markUserEdited);
+            if (!string.IsNullOrEmpty(Config.ActiveProfileKey))
+                _lastAppliedProfileKey = Config.ActiveProfileKey;
+            UpdateTrayStates();
+            return changed;
+        }
+
+        private void ClearPostSwitchGuard()
+        {
+            _expectedSwitchCells = null;
+            _postSwitchGuardUntilMs = -1;
         }
 
         internal bool PrepareFenceInteraction()
@@ -1219,13 +1434,13 @@ namespace DeskFences
 
         private void OnDisplaySettingsChanged(object sender, EventArgs e)
         {
-            PostDesktopUpdate(() => RefreshDesktopHostHandles(true));
+            PostDesktopUpdate(ScheduleDebouncedDisplaySwitch);
         }
 
         private void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
         {
             if (e.Category == UserPreferenceCategory.Desktop)
-                PostDesktopUpdate(() => RefreshDesktopHostHandles(true));
+                PostDesktopUpdate(ScheduleDebouncedDisplaySwitch);
             else if (e.Category == UserPreferenceCategory.General || e.Category == UserPreferenceCategory.Color)
             {
                 PostDesktopUpdate(() =>
@@ -1267,6 +1482,12 @@ namespace DeskFences
             var menu = Win11MenuRenderer.CreateWin11Menu(sysLight, accent, dpiScale);
             menu.Items.Add(Win11MenuRenderer.CreateMenuItem("框选桌面区域新建分区", "\uE7A8", dpiScale, (s, e) => StartRegionDrawNewFence()));
             menu.Items.Add(Win11MenuRenderer.CreateMenuItem("新建桌面分区", "\uE710", dpiScale, (s, e) => CreateNewFence()));
+            menu.Items.Add(new ToolStripSeparator());
+
+            _miProfileInfo = Win11MenuRenderer.CreateMenuItem("屏幕方案：检测中...", "\uE7F4", dpiScale);
+            _miProfileInfo.Enabled = false;
+            menu.Items.Add(_miProfileInfo);
+            menu.Items.Add(Win11MenuRenderer.CreateMenuItem("按当前屏幕方案归位图标", "\uE72C", dpiScale, (s, e) => ReapplyCurrentDisplayProfile()));
             menu.Items.Add(new ToolStripSeparator());
 
             _miLock = Win11MenuRenderer.CreateMenuItem("锁定所有分区位置与大小", "\uE72E", dpiScale, (s, e) =>
@@ -1385,6 +1606,19 @@ namespace DeskFences
 
         private void UpdateTrayStates()
         {
+            if (_miProfileInfo != null)
+            {
+                string label = "默认";
+                DisplayProfile active;
+                if (Config != null && Config.DisplayProfiles != null &&
+                    !string.IsNullOrEmpty(Config.ActiveProfileKey) &&
+                    Config.DisplayProfiles.TryGetValue(Config.ActiveProfileKey, out active) &&
+                    active != null && !string.IsNullOrEmpty(active.Label))
+                {
+                    label = active.Label;
+                }
+                _miProfileInfo.Text = "屏幕方案：" + label;
+            }
             if (_miLock != null) _miLock.Checked = Config.Locked;
             if (_miHideAll != null) _miHideAll.Checked = _fencesHiddenByUser;
             if (_miStartup != null) _miStartup.Checked = IsStartupEnabled();
@@ -1413,6 +1647,10 @@ namespace DeskFences
                 HeaderOpacity = 1.0
             };
             Config.Fences.Add(fc);
+            ClearPostSwitchGuard();
+            DisplayProfileManager.CaptureCurrentProfile(Config, MonitorGrid.GetAreas(m), null, m, true);
+            _lastAppliedProfileKey = Config.ActiveProfileKey;
+            UpdateTrayStates();
             SaveConfig();
             RebuildAllForms(m);
         }
@@ -2113,7 +2351,13 @@ namespace DeskFences
             _pendingDropSnapEnabled = false;
             try
             {
-                if (!_exiting) SaveConfig();
+                if (!_exiting)
+                {
+                    ClearPostSwitchGuard();
+                    if (mutatedForm != null && _lastGridMetrics.CellWidth > 0)
+                        SyncActiveProfileFromFinalCells(_inputSnapshot, _knownIconCells, _lastGridMetrics, true);
+                    SaveConfig();
+                }
                 if (enforce && DesktopReady)
                     EnforceAllRules(false, true, gridDrop);
             }
@@ -2172,6 +2416,7 @@ namespace DeskFences
             RetryPendingSave();
             RefreshDesktopHostHandles(false);
             foreach (var form in _forms.Values.ToList()) form.RecoverMissedMouseUp();
+            if (_displaySwitchPending) return;
             if (!DesktopReady || _isMutatingFence || _isEnforcing || _isAnimatingIcons || _isDrawingRegion || _forms.Count == 0)
                 return;
 
@@ -2193,7 +2438,21 @@ namespace DeskFences
             }
 
             bool periodicRefresh = (nowMs - _lastFullScanMs) >= 3000;
-            bool activeTracking = _desktopMenu.FenceId != null
+            if (periodicRefresh && _lastGridMetrics.CellWidth > 0 && !string.IsNullOrEmpty(_lastAppliedProfileKey))
+            {
+                // Catch silent monitor/work-area/RDP topology changes even if SystemEvents didn't fire.
+                var curAreas = MonitorGrid.GetAreas(_lastGridMetrics);
+                var matched = DisplayProfileManager.FindMatchingProfile(Config, curAreas);
+                if (matched == null || !string.Equals(matched.Key, _lastAppliedProfileKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    ScheduleDebouncedDisplaySwitch();
+                    return;
+                }
+            }
+
+            bool guardActive = _expectedSwitchCells != null && nowMs <= _postSwitchGuardUntilMs;
+            bool activeTracking = guardActive
+                || _desktopMenu.FenceId != null
                 || _recentContextPlacements.Count > 0
                 || (!string.IsNullOrEmpty(_externalDropFenceId) && _externalDropMs >= 0 && (nowMs - _externalDropMs) <= 2000)
                 || (!string.IsNullOrEmpty(_recentRightClickFenceId) && _recentRightClickMs >= 0 && (nowMs - _recentRightClickMs) <= 12000);
@@ -2213,7 +2472,7 @@ namespace DeskFences
         /// </summary>
         private void EnforceAllRules(bool allowManualMembershipChange, bool animateMoves = true, bool gridDrop = false)
         {
-            if (!DesktopReady || _isEnforcing || Config.Fences.Count == 0) return;
+            if (!DesktopReady || _isEnforcing || _displaySwitchPending || Config.Fences.Count == 0) return;
             FinishIconAnimationImmediately();
             _isEnforcing = true;
             try
@@ -2290,6 +2549,53 @@ namespace DeskFences
                         ClearRightClickFallback();
                     }
                 }
+
+                // Anti-Explorer-rebound guard right after a display switch: if Explorer's delayed IconLayouts
+                // restore scrambles icons within 2.5s while the user is NOT manually dragging, silently restore
+                // them back to the profile's target cells without polluting the saved profile!
+                if (dragged.Count > 0 || contextFence != null || externalDropFence != null || fallbackContextFence != null)
+                {
+                    ClearPostSwitchGuard();
+                }
+                else if (_expectedSwitchCells != null)
+                {
+                    if (nowMs <= _postSwitchGuardUntilMs)
+                    {
+                        var reboundMoves = new List<KeyValuePair<string, Point>>();
+                        foreach (var ic in icons)
+                        {
+                            Point expected;
+                            if (string.IsNullOrEmpty(ic.Identity) || !_expectedSwitchCells.TryGetValue(ic.Identity, out expected))
+                                continue;
+                            int curCol = ic.GridCol(m);
+                            int curRow = ic.GridRow(m);
+                            if (curCol != expected.X || curRow != expected.Y)
+                            {
+                                int tx = ic.ClientPosition.X + (expected.X - curCol) * m.CellWidth;
+                                int ty = ic.ClientPosition.Y + (expected.Y - curRow) * m.CellHeight;
+                                reboundMoves.Add(new KeyValuePair<string, Point>(ic.Identity, new Point(tx, ty)));
+                            }
+                        }
+                        if (reboundMoves.Count > 0)
+                        {
+                            _controller.SetListViewRedraw(false);
+                            try
+                            {
+                                if (m.SnapToGridEnabled) _controller.SuspendSnapToGrid();
+                                _controller.MoveIconsBatch(reboundMoves);
+                                _controller.RestoreSnapToGrid();
+                            }
+                            finally
+                            {
+                                _controller.SetListViewRedraw(true);
+                            }
+                            _controller.FlushDesktopPaint();
+                        }
+                        return;
+                    }
+                    ClearPostSwitchGuard();
+                }
+
                 int editingIndex = -1;
                 if ((contextFence != null || fallbackContextFence != null) &&
                     _controller.GetActiveEditControl() != IntPtr.Zero)
@@ -2538,11 +2844,24 @@ namespace DeskFences
                             ic.ScreenBounds.Top + ic.ScreenBounds.Height / 2);
                         Point bestCell;
                         bool foundInner = FindNearestFreeInnerCell(fc, refPt, m, occupied, out bestCell);
-                        if (!foundInner) bestCell = new Point(curCol, curRow);
+                        bool movedOverflow = false;
+                        if (!foundInner)
+                        {
+                            // Extreme tiny-screen overflow: keep membership intact, only step off a fence border ring if needed
+                            if (Config.Fences.Any(f => f.IsOnBorderRing(curCol, curRow)) &&
+                                FindNearestFreeOutsideCell(Config.Fences, refPt, workAreas, m, occupied, out bestCell))
+                            {
+                                movedOverflow = true;
+                            }
+                            else
+                            {
+                                bestCell = new Point(curCol, curRow);
+                            }
+                        }
 
                         occupied.Add(keyOf(bestCell.X, bestCell.Y));
                         finalCells[ic.Identity] = bestCell;
-                        if (foundInner && (bestCell.X != curCol || bestCell.Y != curRow))
+                        if ((foundInner || movedOverflow) && (bestCell.X != curCol || bestCell.Y != curRow))
                         {
                             int targetClientX = ic.ClientPosition.X + (bestCell.X - curCol) * m.CellWidth;
                             int targetClientY = ic.ClientPosition.Y + (bestCell.Y - curRow) * m.CellHeight;
@@ -2702,7 +3021,8 @@ namespace DeskFences
                 foreach (var kv in finalCells)
                     _knownIconCells[kv.Key] = kv.Value;
 
-                if (configDirty) SaveConfig();
+                bool profileChanged = SyncActiveProfileFromFinalCells(icons, finalCells, m, dragged.Count > 0);
+                if (configDirty || profileChanged) SaveConfig();
             }
             finally
             {
@@ -3004,6 +3324,10 @@ namespace DeskFences
                 HeaderOpacity = 1.0
             };
             Config.Fences.Add(fc);
+            ClearPostSwitchGuard();
+            DisplayProfileManager.CaptureCurrentProfile(Config, MonitorGrid.GetAreas(m), null, m, true);
+            _lastAppliedProfileKey = Config.ActiveProfileKey;
+            UpdateTrayStates();
             SaveConfig();
 
             var form = new FenceChromeForm(this, fc);
@@ -3104,7 +3428,12 @@ namespace DeskFences
                 _knownIconCells[ic.Identity] = new Point(dstCol, dstRow);
             }
             if (tracks.Count > 0)
+            {
+                ClearPostSwitchGuard();
+                SyncActiveProfileFromFinalCells(icons, _knownIconCells, m, true);
+                SaveConfig();
                 StartIconSlideAnimation(tracks, m.SnapToGridEnabled);
+            }
         }
 
         public void StartRegionDrawNewFence()
@@ -3158,6 +3487,9 @@ namespace DeskFences
                 form.Dispose();
             }
             _desktopDirty = true;
+            ClearPostSwitchGuard();
+            if (_lastGridMetrics.CellWidth > 0)
+                DisplayProfileManager.CaptureCurrentProfile(Config, MonitorGrid.GetAreas(_lastGridMetrics), null, _lastGridMetrics, true);
             SaveConfig();
         }
 
@@ -3262,6 +3594,7 @@ namespace DeskFences
             _watchTimer.Stop();
             _burstWatchTimer.Stop();
             _iconAnimTimer.Stop();
+            if (_displayChangeTimer != null) _displayChangeTimer.Stop();
             UninstallPassiveMouseHook();
             UninstallDesktopWinEventHook();
             if (_desktopWatcher != null)
@@ -3277,6 +3610,7 @@ namespace DeskFences
             CloseFenceForms();
             _burstWatchTimer.Dispose();
             _iconAnimTimer.Dispose();
+            if (_displayChangeTimer != null) _displayChangeTimer.Dispose();
             _watchTimer.Dispose();
             _controller.Dispose();
             if (_uiInvoker != null && !_uiInvoker.IsDisposed)
