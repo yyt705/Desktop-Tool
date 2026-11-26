@@ -1,0 +1,22 @@
+# Build outputs
+DeskFences.exe
+*.exe
+*.dll
+*.pdb
+bin/
+obj/
+
+# Local runtime desktop layout configs & backups
+fences_config.json
+fences_config.legacy.json
+fences_config.*.tmp
+*.tmp
+
+# IDE & OS metadata
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
