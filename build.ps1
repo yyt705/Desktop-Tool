@@ -36,4 +36,6 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $info = Get-Item $outExe
-Write-Host ("编译成功: {0} ({1:N1} KB)" -f $info.FullName, ($info.Length / 1KB))
+$ver = $info.VersionInfo.ProductVersion
+if (-not $ver) { $ver = $info.VersionInfo.FileVersion }
+Write-Host ("编译成功: {0} v{1} ({2:N1} KB)" -f $info.FullName, $ver, ($info.Length / 1KB))

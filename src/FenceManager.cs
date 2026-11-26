@@ -1289,6 +1289,18 @@ namespace DeskFences
             return menu;
         }
 
+        private static string GetAppVersion()
+        {
+            var attrs = typeof(FenceManager).Assembly.GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false);
+            if (attrs != null && attrs.Length > 0)
+            {
+                string ver = ((System.Reflection.AssemblyInformationalVersionAttribute)attrs[0]).InformationalVersion;
+                if (!string.IsNullOrEmpty(ver)) return ver;
+            }
+            var v = typeof(FenceManager).Assembly.GetName().Version;
+            return v != null ? string.Format("{0}.{1}.{2}", v.Major, v.Minor, v.Build) : "1.0.0";
+        }
+
         private NotifyIcon CreateTrayIcon()
         {
             float dpiScale = NativeMethods.GetWindowDpiScale(IntPtr.Zero);
@@ -1298,10 +1310,12 @@ namespace DeskFences
             _trayMenu = BuildTrayContextMenu(dpiScale, sysLight, accent);
             _trayAppIcon = CreateAppIcon();
 
+            string trayText = string.Format("DeskFences v{0} - 轻量液态玻璃桌面分区", GetAppVersion());
+            if (trayText.Length > 63) trayText = trayText.Substring(0, 63);
             var icon = new NotifyIcon
             {
                 Icon = _trayAppIcon,
-                Text = "DeskFences - 轻量液态玻璃桌面分区",
+                Text = trayText,
                 ContextMenuStrip = _trayMenu,
                 Visible = true
             };
