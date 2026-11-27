@@ -15,6 +15,7 @@ namespace DeskFences
         public const int WM_WINDOWPOSCHANGING = 0x0046;
         public const int WM_DPICHANGED = 0x02E0;
         public const uint GW_HWNDNEXT = 2;
+        public const uint GW_CHILD = 5;
         public const uint MONITOR_DEFAULTTONEAREST = 2;
 
         // Window Styles
@@ -1362,6 +1363,29 @@ namespace DeskFences
             return false;
         }
 
+        public static IntPtr FindDesktopWallpaperWorker()
+        {
+            IntPtr progman = FindWindow("Progman", null);
+            if (progman == IntPtr.Zero) return IntPtr.Zero;
+
+            // Win11 24H2 / Build 26100+ / 26300 Raised Desktop: WorkerW is a direct child of Progman behind SHELLDLL_DefView
+            IntPtr defViewInProgman = FindWindowEx(progman, IntPtr.Zero, "SHELLDLL_DefView", null);
+            IntPtr workerInProgman = FindWindowEx(progman, IntPtr.Zero, "WorkerW", null);
+            if (defViewInProgman != IntPtr.Zero && workerInProgman != IntPtr.Zero)
+                return workerInProgman;
+
+            // Win10 / Win11 23H2 and earlier: top-level WorkerW directly after DesktopOwner
+            IntPtr defView, listView;
+            IntPtr owner = FindDesktopHandles(out defView, out listView);
+            if (listView == IntPtr.Zero) return IntPtr.Zero;
+            IntPtr wallpaperWorker = FindWindowEx(IntPtr.Zero, owner, "WorkerW", null);
+            uint shellPid, wallpaperPid;
+            if (wallpaperWorker != IntPtr.Zero && GetWindowThreadProcessId(owner, out shellPid) != 0 &&
+                GetWindowThreadProcessId(wallpaperWorker, out wallpaperPid) != 0 && shellPid == wallpaperPid)
+                return wallpaperWorker;
+            return IntPtr.Zero;
+        }
+
         public static IntPtr FindDesktopHandles(out IntPtr defView, out IntPtr listView)
         {
             defView = IntPtr.Zero;
@@ -2143,62 +2167,6 @@ namespace DeskFences
             var pt = (NativeMethods.POINT)Marshal.PtrToStructure(_localMem, typeof(NativeMethods.POINT));
             position = new Point(pt.X, pt.Y);
             return true;
-        }
-
-        /// <summary>
-        /// Sets or clears LVIS_CUT (translucent "in-transit" ghost state) on member items purely visually,
-        /// without touching item coordinates or LVS_EX_SNAPTOGRID so Explorer can NEVER displace desktop icons.
-        /// When cut==true, skips items already marked LVIS_CUT by the user's own Ctrl+X and returns only indices we changed.
-        /// </summary>
-        internal List<int> SetMembersCutState(List<DesktopIconInfo> members, bool cut, List<int> indicesToClear = null)
-        {
-            var changed = new List<int>();
-            if (!HasCurrentHandles()) return changed;
-            int count = GetDesktopItemCount();
-            if (count <= 0) return changed;
-
-            int lvItemSize = Marshal.SizeOf(typeof(NativeMethods.LVITEM64));
-            if (!EnsureRemoteBuffer(lvItemSize + 16)) return changed;
-
-            var lvItem = new NativeMethods.LVITEM64
-            {
-                stateMask = NativeMethods.LVIS_CUT,
-                state = cut ? NativeMethods.LVIS_CUT : 0
-            };
-            Marshal.StructureToPtr(lvItem, _localMem, false);
-            UIntPtr written;
-            if (!NativeMethods.WriteProcessMemory(_hProc, _remoteMem, _localMem, (UIntPtr)lvItemSize, out written))
-                return changed;
-
-            if (cut)
-            {
-                if (members == null || members.Count == 0) return changed;
-                foreach (var m in members)
-                {
-                    if (m.Index < 0 || m.Index >= count) continue;
-                    int cur = (int)NativeMethods.SendMessage(ListView, NativeMethods.LVM_GETITEMSTATE,
-                        new IntPtr(m.Index), new IntPtr(NativeMethods.LVIS_CUT));
-                    if ((cur & NativeMethods.LVIS_CUT) != 0) continue;
-                    NativeMethods.SendMessage(ListView, NativeMethods.LVM_SETITEMSTATE, new IntPtr(m.Index), _remoteMem);
-                    changed.Add(m.Index);
-                }
-            }
-            else if (indicesToClear != null && indicesToClear.Count > 0)
-            {
-                foreach (int idx in indicesToClear)
-                {
-                    if (idx < 0 || idx >= count) continue;
-                    NativeMethods.SendMessage(ListView, NativeMethods.LVM_SETITEMSTATE, new IntPtr(idx), _remoteMem);
-                    changed.Add(idx);
-                }
-            }
-            return changed;
-        }
-
-        internal struct DimTiming
-        {
-            public double DimMs;
-            public int DimmedCount;
         }
 
         public void InvalidateDesktopRect(Rectangle dirtyScreenRect)

@@ -1531,13 +1531,17 @@ namespace DeskFences
 
         private void OnDisplaySettingsChanged(object sender, EventArgs e)
         {
+            DesktopWallpaperCache.Invalidate();
             PostDesktopUpdate(ScheduleDebouncedDisplaySwitch);
         }
 
         private void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
         {
             if (e.Category == UserPreferenceCategory.Desktop)
+            {
+                DesktopWallpaperCache.Invalidate();
                 PostDesktopUpdate(ScheduleDebouncedDisplaySwitch);
+            }
             else if (e.Category == UserPreferenceCategory.General || e.Category == UserPreferenceCategory.Color)
             {
                 PostDesktopUpdate(() =>
@@ -2184,24 +2188,17 @@ namespace DeskFences
             return DesktopReady ? _controller.ListView : IntPtr.Zero;
         }
 
-        internal List<int> DimDragMembers(List<DesktopIconInfo> members, out DesktopIconController.DimTiming timing)
+        internal IntPtr GetWallpaperWorkerHandle()
         {
-            timing = new DesktopIconController.DimTiming();
-            if (!CanCommitToCurrentDesktop() || !_isMutatingFence || members == null || members.Count == 0)
-                return null;
-            var sw = Stopwatch.StartNew();
-            var dimmed = _controller.SetMembersCutState(members, true);
-            timing.DimMs = sw.Elapsed.TotalMilliseconds;
-            timing.DimmedCount = dimmed != null ? dimmed.Count : 0;
-            return dimmed;
+            if (!DesktopReady || !_controller.IsOutOfProcessHost()) return IntPtr.Zero;
+            return NativeMethods.FindDesktopWallpaperWorker();
         }
 
-        internal void RestoreDimmedDragMembers(List<DesktopIconInfo> members, List<int> dimmedIndices, Rectangle dirtyScreenRect)
+        internal Color? GetInProcessDesktopBackColor()
         {
-            if (dimmedIndices == null || dimmedIndices.Count == 0 || !CanCommitToCurrentDesktop()) return;
-            _controller.SetMembersCutState(null, false, dimmedIndices);
-            if (!dirtyScreenRect.IsEmpty)
-                _controller.FlushDesktopMemberRects(members, dirtyScreenRect);
+            if (!DesktopReady || _controller.IsOutOfProcessHost()) return null;
+            var ctrl = Control.FromHandle(_controller.ListView);
+            return ctrl != null ? ctrl.BackColor : (Color?)SystemColors.Window;
         }
 
         internal bool CommitRigidDragDrop(
@@ -2213,18 +2210,13 @@ namespace DeskFences
             int targetCol, int targetRow,
             bool clearOutsiders,
             Rectangle oldFenceBounds,
-            List<int> dimmedIndices,
             out bool snapRestored)
         {
             snapRestored = false;
             _pendingDropOutsiderTracks = null;
             _pendingDropSnapEnabled = false;
             if (!CanCommitToCurrentDesktop() || !_isMutatingFence || !_canMoveMembers || form == null)
-            {
-                if (dimmedIndices != null && dimmedIndices.Count > 0 && CanCommitToCurrentDesktop())
-                    _controller.SetMembersCutState(null, false, dimmedIndices);
                 return false;
-            }
 
             int dCol = targetCol - startCol;
             int dRow = targetRow - startRow;
@@ -2239,10 +2231,6 @@ namespace DeskFences
             _controller.SetListViewRedraw(false);
             try
             {
-                // 0. Always clear visual LVIS_CUT dimming inside WM_SETREDRAW(false) so icons return at 100% opacity cleanly.
-                if (dimmedIndices != null && dimmedIndices.Count > 0)
-                    _controller.SetMembersCutState(null, false, dimmedIndices);
-
                 // 1. Plan smooth glide tracks for any conflicting outsiders in the landing zone BEFORE moving members!
                 if (clearOutsiders && (dCol != 0 || dRow != 0))
                 {
@@ -2367,13 +2355,8 @@ namespace DeskFences
             }
 
             if (dCol != 0 || dRow != 0)
-            {
                 _controller.FlushDesktopPaint(form.Bounds, oldFenceBounds.IsEmpty ? null : new[] { oldFenceBounds });
-            }
-            else if (dimmedIndices != null && dimmedIndices.Count > 0)
-            {
-                _controller.FlushDesktopMemberRects(capturedMembers, oldFenceBounds.IsEmpty ? form.Bounds : oldFenceBounds);
-            }
+
             _lastDropClean = committed && ((dCol == 0 && dRow == 0) || plannedOutsidersFromSnapshot);
             return committed;
         }

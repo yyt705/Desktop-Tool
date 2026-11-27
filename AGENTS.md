@@ -26,7 +26,7 @@ After **every** code modification in this repository:
 To prevent "fix A, break B" regressions across real Windows 11 Explorer environments:
 
 1. **Evidence-First Diagnosis**: For any real-desktop latency, visual, or Explorer interaction issue, inspect real telemetry (`%TEMP%\DeskFences_drag_perf.log`, `fences_config.json`) BEFORE modifying code. Never patch Explorer Win32 interactions on guesswork alone.
-2. **Never Fight Explorer with Illegal Coordinates**: NEVER park real desktop icons at offscreen negative/positive coordinates (e.g. `(-5000, -5000)`). Windows 11 `SHELLDLL_DefView` (`CDefView`) with multi-monitor `LVM_SETWORKAREAS` clamps out-of-workarea icons onto `(0,0)` and permanently displaces existing desktop icons. Keep real icons stationary during drag (optional non-positional `LVIS_CUT` dimming only) and commit member moves once on drop.
+2. **Never Fight Explorer with Illegal Coordinates**: NEVER park real desktop icons at offscreen negative/positive coordinates (e.g. `(-5000, -5000)`). Windows 11 `SHELLDLL_DefView` (`CDefView`) with multi-monitor `LVM_SETWORKAREAS` clamps out-of-workarea icons onto `(0,0)` and permanently displaces existing desktop icons. Keep real icons stationary during drag, hide old member icon rects cleanly via the per-pixel `OldSlotMaskForm` wallpaper mask (zero `LVIS_CUT` residue), and commit member moves once on drop.
 3. **Hard UI-Thread Latency Budget (150+ Icon Desktops)**:
    - NEVER call full `GetAllIcons()` synchronously on hover pre-warm, `OnMouseDown`, or steady-state periodic watch ticks when no icon moved.
    - NEVER run blocking out-of-process `PrintWindow` on the UI thread during `OnMouseDown` or `StartActualDrag` (use background `ThreadPool` capture for out-of-process Explorer hosts).

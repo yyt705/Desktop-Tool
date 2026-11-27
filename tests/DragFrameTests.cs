@@ -228,6 +228,8 @@ namespace DeskFences
                         Check(ChromePixels(moving, bodyArea).SequenceEqual(clearBody) &&
                             ChromePixels(stationary, otherArea).SequenceEqual(otherChrome),
                             phase + " failed to clear drag surface interior back to Alpha==0 at rest.");
+                        Check(moving.OldSlotMask == null || !moving.OldSlotMask.IsMaskVisible,
+                            phase + " left OldSlotMaskForm visible at rest!");
                         Check(!timer.Enabled, phase + " left animation timer running.");
                         Check(f.Controller.GetGridMetrics(f.Controller.GetAllIcons()).SnapToGridEnabled,
                             phase + " failed to restore LVS_EX_SNAPTOGRID at rest.");
@@ -324,8 +326,10 @@ namespace DeskFences
                     moving.MovePointer(Cell, 0);
                     Check((bool)typeof(FenceChromeForm).GetField("_isDragSurfaceActive", Instance).GetValue(moving),
                         "Dragging past threshold must activate the rigid icon drag layer.");
-                    Check(NativeMethods.IsWindowVisible(backdrop),
-                        "Backdrop must remain continuously visible during drag so glass brightness never flashes.");
+                    Check(moving.OldSlotMask != null && moving.OldSlotMask.IsMaskVisible && moving.OldSlotMask.MaskBounds == frame,
+                        "Dragging with members must display OldSlotMaskForm cleanly at the fence's original bounds to hide stationary icons.");
+                    Check(!NativeMethods.IsWindowVisible(backdrop),
+                        "Interlayer backdrop must yield to Chrome's matching 1x glass body while OldSlotMaskForm is active (no double-glass seam).");
                     Check(!ChromePixels(moving, bodyArea).SequenceEqual(clearBody),
                         "Rigid drag layer must composite the captured icons cleanly.");
                     Check(f.View.DirectPositions.Count == 0,
@@ -334,8 +338,8 @@ namespace DeskFences
                         "Dragging a fence must NEVER toggle LVS_EX_SNAPTOGRID during pickup/drag!");
                     Check(f.View.Items[0].Position == icons[0].ClientPosition && f.View.Items[1].Position == icons[1].ClientPosition,
                         "Real member icons must stay calmly at their original positions while dragging.");
-                    Check(((int)NativeMethods.SendMessage(f.View.Handle, NativeMethods.LVM_GETITEMSTATE, IntPtr.Zero, new IntPtr(NativeMethods.LVIS_CUT)) & NativeMethods.LVIS_CUT) != 0,
-                        "Stationary originals should be visually dimmed with LVIS_CUT while dragging.");
+                    Check(((int)NativeMethods.SendMessage(f.View.Handle, NativeMethods.LVM_GETITEMSTATE, IntPtr.Zero, new IntPtr(NativeMethods.LVIS_CUT)) & NativeMethods.LVIS_CUT) == 0,
+                        "Dragging must NOT leave faint LVIS_CUT dimmed icons on the desktop (OldSlotMaskForm hides them completely).");
                     Check(f.View.Items[4].Position == topLeftOutsiderStart,
                         "Dragging must NEVER push existing top-left desktop icons!");
                     Check(!(bool)typeof(FenceChromeForm).GetField("_isDragOverlapping", Instance).GetValue(moving),
@@ -360,7 +364,7 @@ namespace DeskFences
                     verifyRest(0, "After capture loss recovery");
 
                     // 4. P0 regression: exiting (_exiting=true) or display/wallpaper rebind (_rebindingDesktop=true)
-                    //    mid-drag MUST keep icons on visible desktop AND cleanly clear LVIS_CUT dimming!
+                    //    mid-drag MUST keep icons on visible desktop AND cleanly hide OldSlotMaskForm!
                     press();
                     moving.MovePointer(Cell, 0);
                     Check(f.View.Items[0].Position == icons[0].ClientPosition && f.View.Items[1].Position == icons[1].ClientPosition,
@@ -368,8 +372,8 @@ namespace DeskFences
                     Set(f.Manager, "_rebindingDesktop", true);
                     moving.SettleInteraction(true, false);
                     Set(f.Manager, "_rebindingDesktop", false);
-                    Check(((int)NativeMethods.SendMessage(f.View.Handle, NativeMethods.LVM_GETITEMSTATE, IntPtr.Zero, new IntPtr(NativeMethods.LVIS_CUT)) & NativeMethods.LVIS_CUT) == 0,
-                        "Rebinding desktop mid-drag must clear LVIS_CUT dimming cleanly!");
+                    Check(moving.OldSlotMask == null || !moving.OldSlotMask.IsMaskVisible,
+                        "Rebinding desktop mid-drag must hide OldSlotMaskForm cleanly!");
 
                     press();
                     moving.MovePointer(-Cell, 0);
@@ -412,18 +416,18 @@ namespace DeskFences
                         mutated.Selected = !mutated.Selected;
                         staleMembers[0] = mutated;
                         preWarmType.GetField("Members").SetValue(pre, staleMembers);
-                        object[] argsStale = new object[] { pre, bodyRect, null };
+                        object[] argsStale = new object[] { pre, bodyRect, null, null };
                         Check(!(bool)adoptMethod.Invoke(moving, argsStale) && argsStale[2] == null,
                             "Pre-warm snapshot MUST be rejected when any member's Selected state changed!");
 
                         preWarmType.GetField("Members").SetValue(pre, new List<DesktopIconInfo>(liveMembers));
                         preWarmType.GetField("CapturedAtMs").SetValue(pre, f.Manager.SessionElapsedMs - 15000);
-                        object[] argsExpired = new object[] { pre, bodyRect, null };
+                        object[] argsExpired = new object[] { pre, bodyRect, null, null };
                         Check(!(bool)adoptMethod.Invoke(moving, argsExpired) && argsExpired[2] == null,
                             "Pre-warm snapshot MUST be rejected when older than 10s!");
 
                         preWarmType.GetField("CapturedAtMs").SetValue(pre, f.Manager.SessionElapsedMs);
-                        object[] argsFresh = new object[] { pre, bodyRect, null };
+                        object[] argsFresh = new object[] { pre, bodyRect, null, null };
                         Check((bool)adoptMethod.Invoke(moving, argsFresh) && object.ReferenceEquals(argsFresh[2], fakeBmp),
                             "Pre-warm snapshot MUST be adopted when every member's live bounds & state match!");
                     }
@@ -879,6 +883,62 @@ namespace DeskFences
             }
         }
 
+        private static void CheckSpringMotionAndWallpaperMask()
+        {
+            // 1. Critically damped spring must produce a natural S-curve (gentle non-teleporting launch,
+            //    monotonic zero-overshoot glide, ~200-270ms natural cell transition, and smooth velocity carryover).
+            double cur = 0.0, vel = 0.0;
+            const double target = 100.0;
+            const double omega = 20.0;
+            FenceChromeForm.StepCriticallyDampedSpring(ref cur, ref vel, target, omega, 0.016);
+            Check(cur >= 2.0 && cur <= 12.0,
+                "Frame-0 spring launch should be a gentle 2%-12% takeoff (not a 54% teleport!). Got " + cur.ToString("F2"));
+
+            double prev = cur;
+            double at100ms = 0, at200ms = 0;
+            for (int step = 2; step <= 75; step++) // up to 600ms at ~8ms steps
+            {
+                FenceChromeForm.StepCriticallyDampedSpring(ref cur, ref vel, target, omega, 0.008);
+                Check(cur >= prev - 1e-6, "Critically damped spring must progress monotonically without reversing.");
+                Check(cur <= target + 1e-5, "Critically damped spring must NEVER overshoot target! Got " + cur);
+                prev = cur;
+                double elapsedMs = 16 + (step - 1) * 8;
+                if (Math.Abs(elapsedMs - 104) < 5) at100ms = cur;
+                if (Math.Abs(elapsedMs - 200) < 5) at200ms = cur;
+            }
+            Check(at100ms >= 45.0 && at100ms <= 75.0, "At ~100ms spring should glide smoothly near midpoint. Got " + at100ms.ToString("F1"));
+            Check(at200ms >= 85.0 && at200ms <= 97.0, "At ~200ms spring should softly approach landing. Got " + at200ms.ToString("F1"));
+            Check(Math.Abs(cur - target) < 0.1, "Spring must converge cleanly to target.");
+
+            // Multi-cell continuity: advancing target mid-glide must carry positive velocity smoothly!
+            cur = 0.0; vel = 0.0;
+            for (int i = 0; i < 8; i++)
+                FenceChromeForm.StepCriticallyDampedSpring(ref cur, ref vel, 100.0, omega, 0.008);
+            double velBeforeStep = vel;
+            FenceChromeForm.StepCriticallyDampedSpring(ref cur, ref vel, 200.0, omega, 0.008);
+            Check(velBeforeStep > 200.0 && vel > velBeforeStep,
+                "Advancing target mid-drag must carry momentum smoothly into the next grid cell.");
+
+            // 2. Old-slot wallpaper mask must be Alpha==255 strictly on member icon rects and Alpha==0 elsewhere!
+            var member = new DesktopIconInfo
+            {
+                ScreenBounds = new Rectangle(140, 140, 48, 60),
+                IconBounds = new Rectangle(148, 142, 32, 32),
+                LabelBounds = new Rectangle(140, 176, 48, 20)
+            };
+            Rectangle maskRect = new Rectangle(100, 100, 200, 200);
+            using (var maskBmp = DesktopWallpaperCache.BuildMemberWallpaperMask(maskRect, new List<DesktopIconInfo> { member }, IntPtr.Zero, Color.FromArgb(42, 96, 180)))
+            {
+                Check(maskBmp != null && maskBmp.Width == 200 && maskBmp.Height == 200, "Wallpaper mask bitmap must match fence bounds.");
+                Color inside = maskBmp.GetPixel(64, 64); // screen (164, 164) inside member icon!
+                Color outside = maskBmp.GetPixel(5, 5);  // screen (105, 105) outside member icon!
+                Check(inside.A == 255 && inside.R == 42 && inside.G == 96 && inside.B == 180,
+                    "Mask pixels over member icon must be opaque (Alpha==255) matching exact clean wallpaper color.");
+                Check(outside.A == 0,
+                    "Mask pixels outside member icon rects must remain strictly transparent (Alpha==0) so neighboring icons are untouched.");
+            }
+        }
+
         internal static void Run(string dir)
         {
             string config = Path.GetFullPath(AppConfig.GetConfigPath());
@@ -889,6 +949,7 @@ namespace DeskFences
             foreach (string path in paths) File.WriteAllText(path, Path.GetFileName(path));
             PrivateDesktopView.OnPrivateDesktop(delegate {
                 CheckGridStepping();
+                CheckSpringMotionAndWallpaperMask();
                 CheckCollision(paths.Take(2).ToArray(), true, true);
                 CheckCollision(paths.Take(2).ToArray(), false, true);
                 CheckCollision(paths.Take(2).ToArray(), true, false);

@@ -494,6 +494,101 @@ namespace DeskFences
     }
 
     /// <summary>
+    /// Per-pixel layered click-through wallpaper mask placed strictly behind FenceChromeForm
+    /// and strictly above SHELLDLL_DefView (SysListView32) ONLY during active fence drags.
+    /// Masks ONLY the tight bounding rects of the dragged fence's stationary member icons with
+    /// exact clean desktop wallpaper (Alpha==255), leaving all other pixels strictly Alpha==0.
+    /// Completely hides old icons during drag with ZERO offscreen coordinate movement and ZERO LVIS_CUT residue.
+    /// </summary>
+    internal sealed class OldSlotMaskForm : Form
+    {
+        private IntPtr _insertAfter = IntPtr.Zero;
+        internal bool IsMaskVisible { get; private set; }
+        internal Rectangle MaskBounds { get; private set; }
+
+        public OldSlotMaskForm()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.Manual;
+        }
+
+        protected override bool ShowWithoutActivation { get { return true; } }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= NativeMethods.WS_EX_TOOLWINDOW
+                            | NativeMethods.WS_EX_LAYERED
+                            | NativeMethods.WS_EX_TRANSPARENT
+                            | NativeMethods.WS_EX_NOACTIVATE;
+                return cp;
+            }
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg == NativeMethods.WM_WINDOWPOSCHANGING)
+            {
+                var wp = (NativeMethods.WINDOWPOS)Marshal.PtrToStructure(m.LParam, typeof(NativeMethods.WINDOWPOS));
+                wp.flags |= NativeMethods.SWP_NOACTIVATE;
+                if (_insertAfter != IntPtr.Zero && NativeMethods.IsWindow(_insertAfter))
+                {
+                    wp.hwndInsertAfter = _insertAfter;
+                    wp.flags &= ~NativeMethods.SWP_NOZORDER;
+                }
+                else
+                {
+                    wp.hwndInsertAfter = NativeMethods.HWND_BOTTOM;
+                    wp.flags &= ~NativeMethods.SWP_NOZORDER;
+                }
+                Marshal.StructureToPtr(wp, m.LParam, false);
+            }
+            base.WndProc(ref m);
+        }
+
+        public void ShowMask(Rectangle screenRect, Bitmap premulMask, IntPtr desktopOwner, IntPtr chromeHwnd)
+        {
+            if (premulMask == null || screenRect.Width <= 0 || screenRect.Height <= 0) return;
+            if (!IsHandleCreated) { var ensure = Handle; }
+            if (desktopOwner != IntPtr.Zero)
+                NativeMethods.SetWindowLongPtr(Handle, NativeMethods.GWLP_HWNDPARENT, desktopOwner);
+
+            _insertAfter = (chromeHwnd != IntPtr.Zero && NativeMethods.IsWindow(chromeHwnd))
+                ? chromeHwnd : NativeMethods.HWND_BOTTOM;
+            MaskBounds = screenRect;
+            NativeMethods.PresentLayeredBitmap(Handle, premulMask, screenRect.X, screenRect.Y);
+            NativeMethods.SetWindowPos(
+                Handle,
+                _insertAfter,
+                screenRect.X, screenRect.Y, screenRect.Width, screenRect.Height,
+                NativeMethods.SWP_NOACTIVATE | NativeMethods.SWP_SHOWWINDOW);
+            IsMaskVisible = true;
+        }
+
+        public void EnsureBehind(IntPtr chromeHwnd)
+        {
+            if (!IsMaskVisible || !IsHandleCreated) return;
+            _insertAfter = (chromeHwnd != IntPtr.Zero && NativeMethods.IsWindow(chromeHwnd))
+                ? chromeHwnd : NativeMethods.HWND_BOTTOM;
+            NativeMethods.SetWindowPos(
+                Handle, _insertAfter, 0, 0, 0, 0,
+                NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE);
+        }
+
+        public void HideMask()
+        {
+            IsMaskVisible = false;
+            MaskBounds = Rectangle.Empty;
+            _insertAfter = IntPtr.Zero;
+            if (IsHandleCreated)
+                NativeMethods.ShowWindow(Handle, NativeMethods.SW_HIDE);
+        }
+    }
+
+    /// <summary>
     /// True per-pixel translucent Apple Liquid Glass frame rendered via UpdateLayeredWindow:
     /// - At rest: interior pixels have Alpha == 0 (100% natively mouse click-through to Windows Desktop!),
     ///   while the sheer translucent Title Bar + Directional Specular Rim show LIVE Wallpaper Engine underneath
@@ -524,9 +619,14 @@ namespace DeskFences
         private bool _dragRelocated;
         private bool _isDragOverlapping;
         private Bitmap _dragNativeIconsLayer;
+        private Bitmap _dragOldSlotMaskLayer;
+        private OldSlotMaskForm _oldSlotMask;
+        private bool _oldSlotMaskActive;
+        internal OldSlotMaskForm OldSlotMask { get { return _oldSlotMask; } }
         private sealed class DragPreWarm : IDisposable
         {
             public Bitmap Layer;
+            public Bitmap OldSlotMask;
             public Rectangle FenceBounds;
             public int HeaderHeight;
             public int HostGeneration;
@@ -542,6 +642,11 @@ namespace DeskFences
                 {
                     Layer.Dispose();
                     Layer = null;
+                }
+                if (OldSlotMask != null)
+                {
+                    OldSlotMask.Dispose();
+                    OldSlotMask = null;
                 }
             }
         }
@@ -563,8 +668,7 @@ namespace DeskFences
         private bool _perfUsedAsyncMidDragCap;
         private NativeMethods.CaptureDiag _perfCapDiag;
         private double _perfRedrawMs;
-        private double _perfDimTotalMs;
-        private DesktopIconController.DimTiming _perfDimTiming;
+        private double _perfMaskTotalMs;
         private double _perfStartEndMs;
         private bool _perfLoggedFirstStep;
         private double _perfFirstStepSinceDownMs;
@@ -583,7 +687,6 @@ namespace DeskFences
         private DesktopGridMetrics _dragMetrics;
         private Rectangle[] _dragWorkAreas;
         private List<DesktopIconInfo> _capturedMembers;
-        private List<int> _dimmedMemberIndices;
 
         private enum ResizeEdge { None, Left, Right, Top, Bottom, TopLeft, TopRight, BottomLeft, BottomRight }
         private ResizeEdge _pendingResizeEdge = ResizeEdge.None;
@@ -606,12 +709,13 @@ namespace DeskFences
         private Form _renamePopup;
         private Font _titleFont;
 
-        // Smooth frame-rate-independent exponential spring animation
+        // Smooth frame-rate-independent critically damped 2nd-order spring animation
         private readonly Timer _animTimer;
         private readonly Stopwatch _animWatch = new Stopwatch();
         private bool _holdingHighResTimer;
         private double _animLastMs;
         private double _curX, _curY, _curW, _curH;
+        private double _velX, _velY, _velW, _velH;
         private Rectangle _animTargetBounds;
         private bool _releasePending;
         private bool _completingInteraction;
@@ -734,8 +838,17 @@ namespace DeskFences
             if (m.Msg == NativeMethods.WM_WINDOWPOSCHANGING)
             {
                 var wp = (NativeMethods.WINDOWPOS)Marshal.PtrToStructure(m.LParam, typeof(NativeMethods.WINDOWPOS));
-                wp.hwndInsertAfter = NativeMethods.HWND_BOTTOM;
-                wp.flags &= ~NativeMethods.SWP_NOZORDER;
+                if (_oldSlotMaskActive && _oldSlotMask != null && _oldSlotMask.IsMaskVisible)
+                {
+                    // Preserve Z-order directly above OldSlotMaskForm during drag moves so the moving fence
+                    // never slips behind the stationary old-slot wallpaper mask.
+                    wp.flags |= NativeMethods.SWP_NOZORDER;
+                }
+                else
+                {
+                    wp.hwndInsertAfter = NativeMethods.HWND_BOTTOM;
+                    wp.flags &= ~NativeMethods.SWP_NOZORDER;
+                }
                 Marshal.StructureToPtr(wp, m.LParam, false);
             }
             else if (m.Msg == NativeMethods.WM_DPICHANGED)
@@ -881,23 +994,36 @@ namespace DeskFences
             StepAnimation(dt);
         }
 
+        /// <summary>
+        /// Exact closed-form critically damped 2nd-order spring (zeta = 1.0, zero overshoot).
+        /// Produces natural S-curve acceleration and cushioned deceleration while preserving
+        /// continuous momentum across multi-cell drags at any frame rate.
+        /// </summary>
+        internal static void StepCriticallyDampedSpring(ref double cur, ref double vel, double target, double omega, double dt)
+        {
+            double d = cur - target;
+            double e = Math.Exp(-omega * dt);
+            double c2 = vel + omega * d;
+            cur = target + (d + c2 * dt) * e;
+            vel = (vel - c2 * omega * dt) * e;
+        }
+
         private void StepAnimation(double dt)
         {
-            // Ultra-crisp magnetic spring during active grid dragging (48.0),
-            // softer landing glide (30.0) on release / overlap auto-relocation / resize.
-            double stiffness = _isDragging ? 48.0 : 30.0;
-            double alpha = 1.0 - Math.Exp(-dt * stiffness);
-
-            _curX += (_animTargetBounds.X - _curX) * alpha;
-            _curY += (_animTargetBounds.Y - _curY) * alpha;
-            _curW += (_animTargetBounds.Width - _curW) * alpha;
-            _curH += (_animTargetBounds.Height - _curH) * alpha;
+            // Natural Apple-style critically damped spring:
+            // omega=20.0 (~240ms smooth cell-to-cell S-curve with gentle velocity carryover across cells),
+            // omega=18.0 for slightly softer landing / overlap relocation / resize cushion.
+            double omega = _isDragging ? 20.0 : 18.0;
+            StepCriticallyDampedSpring(ref _curX, ref _velX, _animTargetBounds.X, omega, dt);
+            StepCriticallyDampedSpring(ref _curY, ref _velY, _animTargetBounds.Y, omega, dt);
+            StepCriticallyDampedSpring(ref _curW, ref _velW, _animTargetBounds.Width, omega, dt);
+            StepCriticallyDampedSpring(ref _curH, ref _velH, _animTargetBounds.Height, omega, dt);
 
             bool settled =
-                Math.Abs(_animTargetBounds.X - _curX) < 0.6 &&
-                Math.Abs(_animTargetBounds.Y - _curY) < 0.6 &&
-                Math.Abs(_animTargetBounds.Width - _curW) < 0.6 &&
-                Math.Abs(_animTargetBounds.Height - _curH) < 0.6;
+                Math.Abs(_animTargetBounds.X - _curX) < 0.5 && Math.Abs(_velX) < 12.0 &&
+                Math.Abs(_animTargetBounds.Y - _curY) < 0.5 && Math.Abs(_velY) < 12.0 &&
+                Math.Abs(_animTargetBounds.Width - _curW) < 0.5 && Math.Abs(_velW) < 12.0 &&
+                Math.Abs(_animTargetBounds.Height - _curH) < 0.5 && Math.Abs(_velH) < 12.0;
 
             int x = settled ? _animTargetBounds.X : (int)Math.Round(_curX);
             int y = settled ? _animTargetBounds.Y : (int)Math.Round(_curY);
@@ -919,12 +1045,12 @@ namespace DeskFences
                     Bounds = new Rectangle(x, y, w, h);
                 }
 
-                if (Config.BackdropOpacity > 0.01)
+                if (!_oldSlotMaskActive && Config.BackdropOpacity > 0.01)
                     SyncBackdrop();
             }
 
             if (settled) FinishAnimation();
-            else ApplyResizeFrame(alpha, false);
+            else ApplyResizeFrame(1.0 - Math.Exp(-dt * omega), false);
         }
 
         private void ApplyResizeFrame(double alpha, bool settled)
@@ -949,6 +1075,7 @@ namespace DeskFences
 
         private void FinishAnimation()
         {
+            _velX = _velY = _velW = _velH = 0;
             StopAnimTimer();
             if (_dragReleasePending)
                 CompleteRigidDrag(true, true);
@@ -958,16 +1085,15 @@ namespace DeskFences
                 ApplyResizeFrame(1.0, true);
         }
 
-        private void PumpAnimationIfDue(bool forceImmediate = false)
+        private void PumpAnimationIfDue()
         {
             if (!_animTimer.Enabled) return;
             double nowMs = _animWatch.Elapsed.TotalMilliseconds;
             double elapsedMs = nowMs - _animLastMs;
-            if (!forceImmediate && elapsedMs < 6.0) return;
+            // Strictly advance only by real elapsed wall-clock time (never fabricate fake dt jumps on high-Hz mice!)
+            if (elapsedMs < 6.0) return;
             _animLastMs = nowMs;
-            double dt = forceImmediate
-                ? Math.Max(0.012, Math.Min(0.04, elapsedMs / 1000.0))
-                : Math.Min(0.05, Math.Max(0.004, elapsedMs / 1000.0));
+            double dt = Math.Min(0.04, elapsedMs / 1000.0);
             StepAnimation(dt);
         }
 
@@ -987,18 +1113,18 @@ namespace DeskFences
                 _curY = Bounds.Y;
                 _curW = Bounds.Width;
                 _curH = Bounds.Height;
+                _velX = _velY = _velW = _velH = 0;
                 _animWatch.Restart();
                 _animLastMs = 0;
                 StartAnimTimer();
-                // Step immediately on frame 0 so the fence reacts on the very same mouse event
-                // instead of waiting for the first WinForms timer tick.
+                // Gentle immediate frame-0 spring launch (~4% of cell, ~3px) so the fence visibly begins
+                // moving on the exact mouse event without a jarring teleport jump.
                 StepAnimation(0.016);
             }
             else
             {
-                // Advance immediately on target change even when high-Hz WM_MOUSEMOVE events
-                // are arriving faster than low-priority WM_TIMER ticks.
-                PumpAnimationIfDue(true);
+                // Advance smoothly on real elapsed time without warping the spring clock.
+                PumpAnimationIfDue();
             }
         }
 
@@ -1126,6 +1252,8 @@ namespace DeskFences
             Rectangle bodyScreenRect = new Rectangle(reqFenceBounds.X, reqFenceBounds.Y + hh, reqFenceBounds.Width, Math.Max(2, reqFenceBounds.Height - hh));
             IntPtr lv = _manager.GetDesktopListViewHandle();
             if (lv == IntPtr.Zero) return false;
+            IntPtr wallpaperWorker = _manager.GetWallpaperWorkerHandle();
+            Color? inProcBackColor = _manager.GetInProcessDesktopBackColor();
 
             bool anySelected = false;
             for (int i = 0; i < members.Count; i++)
@@ -1134,8 +1262,8 @@ namespace DeskFences
             }
             bool desktopWasFg = _manager.IsDesktopListViewForeground();
 
-            // For out-of-process real Explorer: run PrintWindow(0) on a background ThreadPool thread so
-            // DeskFences' UI thread NEVER stalls for 150-220ms during hover, mouse-down, or drag start!
+            // For out-of-process real Explorer: run PrintWindow(0) AND wallpaper mask generation on a
+            // background ThreadPool thread so DeskFences' UI thread NEVER stalls during hover, click, or drag start!
             // For in-process PrivateDesktopView unit tests: run inline synchronously (~5ms) to avoid same-thread SendMessage deadlock.
             if (_manager.IsOutOfProcessDesktopHost())
             {
@@ -1147,14 +1275,18 @@ namespace DeskFences
                     var capSw = Stopwatch.StartNew();
                     NativeMethods.CaptureDiag diag;
                     Bitmap bmp = null;
+                    Bitmap maskBmp = null;
                     try
                     {
                         bmp = NativeMethods.CaptureNativeListViewIconsTransparent(lv, bodyScreenRect, membersCopy, out diag);
+                        if (bmp != null && !diag.UsedFallbackFullContent)
+                            maskBmp = DesktopWallpaperCache.BuildMemberWallpaperMask(reqFenceBounds, membersCopy, wallpaperWorker, null);
                     }
                     catch
                     {
                         diag = new NativeMethods.CaptureDiag();
                         if (bmp != null) { bmp.Dispose(); bmp = null; }
+                        if (maskBmp != null) { maskBmp.Dispose(); maskBmp = null; }
                     }
                     double capMs = capSw.Elapsed.TotalMilliseconds;
                     try
@@ -1162,18 +1294,20 @@ namespace DeskFences
                         if (!IsDisposed && IsHandleCreated)
                         {
                             BeginInvoke((Action)(() => CompleteAsyncPreWarmCapture(
-                                bmp, diag, reqFenceBounds, hh, hostGen, itemCount, anySelected, desktopWasFg,
+                                bmp, maskBmp, diag, reqFenceBounds, hh, hostGen, itemCount, anySelected, desktopWasFg,
                                 membersCopy, usedFastPath, getMs, capMs, forActiveDrag, capturedDragSeq)));
                         }
-                        else if (bmp != null)
+                        else
                         {
-                            bmp.Dispose();
+                            if (bmp != null) bmp.Dispose();
+                            if (maskBmp != null) maskBmp.Dispose();
                         }
                     }
                     catch
                     {
                         _asyncCaptureInFlight = false;
                         if (bmp != null) bmp.Dispose();
+                        if (maskBmp != null) maskBmp.Dispose();
                     }
                 });
                 return true;
@@ -1182,24 +1316,27 @@ namespace DeskFences
             // In-process synchronous path (PrivateDesktopView regression tests)
             NativeMethods.CaptureDiag syncDiag;
             Bitmap syncBmp = NativeMethods.CaptureNativeListViewIconsTransparent(lv, bodyScreenRect, members, out syncDiag);
+            Bitmap syncMask = (syncBmp != null && !syncDiag.UsedFallbackFullContent)
+                ? DesktopWallpaperCache.BuildMemberWallpaperMask(reqFenceBounds, members, IntPtr.Zero, inProcBackColor)
+                : null;
             double syncCapMs = sw.Elapsed.TotalMilliseconds - getMs;
-            return StoreOrApplyCapturedBitmap(syncBmp, syncDiag, reqFenceBounds, hh, hostGen, itemCount,
+            return StoreOrApplyCapturedBitmap(syncBmp, syncMask, syncDiag, reqFenceBounds, hh, hostGen, itemCount,
                 anySelected, desktopWasFg, members, usedFastPath, getMs, syncCapMs, forActiveDrag, explicitDragSeq);
         }
 
         private void CompleteAsyncPreWarmCapture(
-            Bitmap bmp, NativeMethods.CaptureDiag diag, Rectangle reqFenceBounds, int hh,
+            Bitmap bmp, Bitmap maskBmp, NativeMethods.CaptureDiag diag, Rectangle reqFenceBounds, int hh,
             int hostGen, int itemCount, bool anySelected, bool desktopWasFg,
             List<DesktopIconInfo> members, bool usedFastPath, double getMs, double capMs,
             bool forActiveDrag, int reqDragSeq)
         {
             _asyncCaptureInFlight = false;
-            StoreOrApplyCapturedBitmap(bmp, diag, reqFenceBounds, hh, hostGen, itemCount,
+            StoreOrApplyCapturedBitmap(bmp, maskBmp, diag, reqFenceBounds, hh, hostGen, itemCount,
                 anySelected, desktopWasFg, members, usedFastPath, getMs, capMs, forActiveDrag, reqDragSeq);
         }
 
         private bool StoreOrApplyCapturedBitmap(
-            Bitmap bmp, NativeMethods.CaptureDiag diag, Rectangle reqFenceBounds, int hh,
+            Bitmap bmp, Bitmap maskBmp, NativeMethods.CaptureDiag diag, Rectangle reqFenceBounds, int hh,
             int hostGen, int itemCount, bool anySelected, bool desktopWasFg,
             List<DesktopIconInfo> members, bool usedFastPath, double getMs, double capMs,
             bool forActiveDrag, int reqDragSeq)
@@ -1207,10 +1344,12 @@ namespace DeskFences
             if (IsDisposed || !IsHandleCreated)
             {
                 if (bmp != null) bmp.Dispose();
+                if (maskBmp != null) maskBmp.Dispose();
                 return false;
             }
             if (bmp == null)
             {
+                if (maskBmp != null) maskBmp.Dispose();
                 _hoverWarmCooldownUntilMs = _manager.SessionElapsedMs + 2500;
                 _lastPreWarmInfo = string.Format("nullBmp(get={0:F1},cap={1:F1})", getMs, capMs);
                 return false;
@@ -1218,16 +1357,17 @@ namespace DeskFences
             if (diag.UsedFallbackFullContent)
             {
                 bmp.Dispose();
+                if (maskBmp != null) maskBmp.Dispose();
                 _hoverWarmCooldownUntilMs = _manager.SessionElapsedMs + 2500;
                 _lastPreWarmInfo = string.Format("fallbackSkip(get={0:F1},cap={1:F1})", getMs, capMs);
                 return false;
             }
 
-            _lastPreWarmInfo = string.Format("ok(fast={0},get={1:F1},cap={2:F1},iA={3},lA={4})",
-                usedFastPath ? 1 : 0, getMs, capMs, diag.UsedTrueIconAlpha ? 1 : 0, diag.UsedTrueLabelAlpha ? 1 : 0);
+            _lastPreWarmInfo = string.Format("ok(fast={0},get={1:F1},cap={2:F1},iA={3},lA={4},mask={5})",
+                usedFastPath ? 1 : 0, getMs, capMs, diag.UsedTrueIconAlpha ? 1 : 0, diag.UsedTrueLabelAlpha ? 1 : 0, maskBmp != null ? 1 : 0);
 
             // If the user ALREADY started dragging this fence while background PrintWindow was running,
-            // seamlessly attach the freshly captured 32-bit ARGB icons mid-drag (real icons stayed untouched at origin!).
+            // seamlessly attach the freshly captured 32-bit ARGB icons + old-slot wallpaper mask mid-drag!
             bool matchesActiveDragSeq = forActiveDrag ? (_dragSessionSeq == reqDragSeq) : (_dragSessionSeq == reqDragSeq + 1);
             if (_isDragging && _dragNativeIconsLayer == null &&
                 matchesActiveDragSeq &&
@@ -1236,18 +1376,11 @@ namespace DeskFences
                 _capturedMembers != null && _capturedMembers.Count == members.Count)
             {
                 _dragNativeIconsLayer = bmp;
-                _isDragSurfaceActive = true;
+                _dragOldSlotMaskLayer = maskBmp;
                 _perfUsedAsyncMidDragCap = true;
                 _perfCaptureMs = capMs;
                 _perfCapDiag = diag;
-                RedrawLayeredSurface();
-                if (_dimmedMemberIndices == null && _capturedMembers.Count > 0)
-                {
-                    DesktopIconController.DimTiming dt;
-                    _dimmedMemberIndices = _manager.DimDragMembers(_capturedMembers, out dt);
-                    _perfDimTiming = dt;
-                    _perfDimTotalMs = dt.DimMs;
-                }
+                ActivateCapturedDragVisuals();
                 return true;
             }
 
@@ -1257,6 +1390,7 @@ namespace DeskFences
                 _manager.GetDesktopItemCount() != itemCount)
             {
                 bmp.Dispose();
+                if (maskBmp != null) maskBmp.Dispose();
                 return false;
             }
 
@@ -1264,6 +1398,7 @@ namespace DeskFences
             _dragPreWarm = new DragPreWarm
             {
                 Layer = bmp,
+                OldSlotMask = maskBmp,
                 FenceBounds = reqFenceBounds,
                 HeaderHeight = hh,
                 HostGeneration = hostGen,
@@ -1276,9 +1411,10 @@ namespace DeskFences
             return true;
         }
 
-        private bool TryAdoptPreWarm(DragPreWarm pre, Rectangle bodyScreenRect, out Bitmap layer)
+        private bool TryAdoptPreWarm(DragPreWarm pre, Rectangle bodyScreenRect, out Bitmap layer, out Bitmap oldSlotMask)
         {
             layer = null;
+            oldSlotMask = null;
             _lastPreWarmRejectReason = "none";
             if (pre == null || pre.Layer == null || _capturedMembers == null) { _lastPreWarmRejectReason = "null"; return false; }
             if (pre.FenceBounds != Bounds || pre.HeaderHeight != HeaderHeight) { _lastPreWarmRejectReason = "bounds"; return false; }
@@ -1308,20 +1444,56 @@ namespace DeskFences
 
             layer = pre.Layer;
             pre.Layer = null;
+            oldSlotMask = pre.OldSlotMask;
+            pre.OldSlotMask = null;
             return true;
+        }
+
+        private void ActivateCapturedDragVisuals()
+        {
+            var sw = Stopwatch.StartNew();
+            bool hasMask = _dragOldSlotMaskLayer != null && !_dragStartBounds.IsEmpty;
+            _isDragSurfaceActive = true;
+            _oldSlotMaskActive = hasMask;
+
+            if (hasMask)
+            {
+                // Anchor FenceChromeForm at desktop bottom BEFORE showing OldSlotMaskForm directly behind it
+                // so Z-order is strictly: Normal Apps > FenceChromeForm > OldSlotMaskForm > SysListView32 > Wallpaper.
+                if (IsHandleCreated)
+                {
+                    NativeMethods.SetWindowPos(
+                        Handle, NativeMethods.HWND_BOTTOM, 0, 0, 0, 0,
+                        NativeMethods.SWP_NOMOVE | NativeMethods.SWP_NOSIZE | NativeMethods.SWP_NOACTIVATE);
+                }
+            }
+
+            double tRedraw = sw.Elapsed.TotalMilliseconds;
+            RedrawLayeredSurface();
+            _perfRedrawMs = sw.Elapsed.TotalMilliseconds - tRedraw;
+
+            if (hasMask)
+            {
+                double tMask = sw.Elapsed.TotalMilliseconds;
+                if (_oldSlotMask == null || _oldSlotMask.IsDisposed)
+                    _oldSlotMask = new OldSlotMaskForm();
+                _oldSlotMask.ShowMask(_dragStartBounds, _dragOldSlotMaskLayer, _manager.GetDesktopOwner(), Handle);
+                if (Backdrop != null && !Backdrop.IsDisposed)
+                    Backdrop.HideBackdrop();
+                _perfMaskTotalMs = sw.Elapsed.TotalMilliseconds - tMask;
+            }
         }
 
         private void EnterRigidDragSurface()
         {
             DisposeDragVisuals();
-            _dimmedMemberIndices = null;
+            _oldSlotMaskActive = false;
             _perfCaptureMs = 0;
             _perfAdoptedPreWarm = false;
             _perfUsedAsyncMidDragCap = false;
             _perfCapDiag = new NativeMethods.CaptureDiag();
             _perfRedrawMs = 0;
-            _perfDimTotalMs = 0;
-            _perfDimTiming = new DesktopIconController.DimTiming();
+            _perfMaskTotalMs = 0;
             var pre = _dragPreWarm;
             _dragPreWarm = null;
             if (_hoverWarmTimer != null && _hoverWarmTimer.Enabled)
@@ -1339,9 +1511,11 @@ namespace DeskFences
             int hh = HeaderHeight;
             Rectangle bodyScreenRect = new Rectangle(_dragStartBounds.X, _dragStartBounds.Y + hh, _dragStartBounds.Width, Math.Max(2, _dragStartBounds.Height - hh));
             Bitmap adopted;
-            if (TryAdoptPreWarm(pre, bodyScreenRect, out adopted))
+            Bitmap adoptedMask;
+            if (TryAdoptPreWarm(pre, bodyScreenRect, out adopted, out adoptedMask))
             {
                 _dragNativeIconsLayer = adopted;
+                _dragOldSlotMaskLayer = adoptedMask;
                 _perfAdoptedPreWarm = true;
             }
             else
@@ -1352,12 +1526,16 @@ namespace DeskFences
                     // In-process PrivateDesktopView tests: capture inline synchronously (~5ms)
                     IntPtr lv = _manager.GetDesktopListViewHandle();
                     if (lv != IntPtr.Zero)
+                    {
                         _dragNativeIconsLayer = NativeMethods.CaptureNativeListViewIconsTransparent(lv, bodyScreenRect, _capturedMembers, out _perfCapDiag);
+                        if (_dragNativeIconsLayer != null && !_perfCapDiag.UsedFallbackFullContent)
+                            _dragOldSlotMaskLayer = DesktopWallpaperCache.BuildMemberWallpaperMask(_dragStartBounds, _capturedMembers, IntPtr.Zero, _manager.GetInProcessDesktopBackColor());
+                    }
                 }
                 else if (!_asyncCaptureInFlight && _manager.SessionElapsedMs >= _hoverWarmCooldownUntilMs)
                 {
                     // Real Explorer cold click: NEVER block UI thread for 200ms! Start dragging on Frame 0
-                    // while background PrintWindow captures the untouched stationary originals and attaches seamlessly.
+                    // while background PrintWindow + wallpaper mask captures the untouched originals and attaches seamlessly.
                     StartPreWarmCapture(true, _capturedMembers, _dragStartBounds, _dragSessionSeq);
                 }
             }
@@ -1365,16 +1543,12 @@ namespace DeskFences
 
             if (_dragNativeIconsLayer != null)
             {
-                // Present captured 32-bit ARGB icons on FenceChromeForm and softly dim stationary originals
-                // via LVIS_CUT — ZERO offscreen coordinate moves, ZERO SnapToGrid toggles, ZERO top-left icon displacement!
-                double tRedraw = sw.Elapsed.TotalMilliseconds;
-                _isDragSurfaceActive = true;
-                RedrawLayeredSurface();
-                _perfRedrawMs = sw.Elapsed.TotalMilliseconds - tRedraw;
-
-                double tDim = sw.Elapsed.TotalMilliseconds;
-                _dimmedMemberIndices = _manager.DimDragMembers(_capturedMembers, out _perfDimTiming);
-                _perfDimTotalMs = sw.Elapsed.TotalMilliseconds - tDim;
+                if (_dragOldSlotMaskLayer == null && !_dragStartBounds.IsEmpty)
+                {
+                    _dragOldSlotMaskLayer = DesktopWallpaperCache.BuildMemberWallpaperMask(
+                        _dragStartBounds, _capturedMembers, _manager.GetWallpaperWorkerHandle(), _manager.GetInProcessDesktopBackColor());
+                }
+                ActivateCapturedDragVisuals();
             }
             else
             {
@@ -1391,7 +1565,7 @@ namespace DeskFences
                 if (System.IO.File.Exists(logPath) && new System.IO.FileInfo(logPath).Length > 65536)
                     System.IO.File.Delete(logPath);
                 string line = string.Format(
-                    "[{0:HH:mm:ss.fff}] title={1} mem={2} cell={3}x{4} moved={5} | hover={6} | down={7:F1}ms(hadW={8},didW={9}) | down->start={10:F1}ms | begin={11:F1}ms({12}) | cap={13:F1}ms(adopt={14},asyncMid={15},rej={16},iA={17},lA={18},fb={19}) | redraw={20:F1}ms | dim={21:F1}ms(cnt={22}) | step1={23}(down->{24:F1}ms,startEnd->{25:F1}ms,d={26}x{27},anim={28:F1}ms){29}",
+                    "[{0:HH:mm:ss.fff}] title={1} mem={2} cell={3}x{4} moved={5} | hover={6} | down={7:F1}ms(hadW={8},didW={9}) | down->start={10:F1}ms | begin={11:F1}ms({12}) | cap={13:F1}ms(adopt={14},asyncMid={15},rej={16},iA={17},lA={18},fb={19}) | redraw={20:F1}ms | mask={21:F1}ms(on={22}) | step1={23}(down->{24:F1}ms,startEnd->{25:F1}ms,d={26}x{27},anim={28:F1}ms){29}",
                     DateTime.Now,
                     Config.Title,
                     memberCount,
@@ -1413,8 +1587,8 @@ namespace DeskFences
                     _perfCapDiag.UsedTrueLabelAlpha ? 1 : 0,
                     _perfCapDiag.UsedFallbackFullContent ? 1 : 0,
                     _perfRedrawMs,
-                    _perfDimTotalMs,
-                    _perfDimTiming.DimmedCount,
+                    _perfMaskTotalMs,
+                    _oldSlotMask != null && _oldSlotMask.IsMaskVisible ? 1 : 0,
                     _perfLoggedFirstStep ? 1 : 0,
                     _perfFirstStepSinceDownMs,
                     _perfFirstStepSinceStartMs,
@@ -1430,11 +1604,19 @@ namespace DeskFences
         private void ExitRigidDragSurface()
         {
             _isDragSurfaceActive = false;
+            _oldSlotMaskActive = false;
             DisposeDragVisuals();
             if (!Disposing && !IsDisposed)
             {
-                RedrawLayeredSurface();
                 SyncBackdrop();
+                RedrawLayeredSurface();
+                if (_oldSlotMask != null && !_oldSlotMask.IsDisposed)
+                    _oldSlotMask.HideMask();
+                SendToDesktopBottom();
+            }
+            else if (_oldSlotMask != null && !_oldSlotMask.IsDisposed)
+            {
+                _oldSlotMask.HideMask();
             }
         }
 
@@ -1444,6 +1626,11 @@ namespace DeskFences
             {
                 _dragNativeIconsLayer.Dispose();
                 _dragNativeIconsLayer = null;
+            }
+            if (_dragOldSlotMaskLayer != null)
+            {
+                _dragOldSlotMaskLayer.Dispose();
+                _dragOldSlotMaskLayer = null;
             }
         }
 
@@ -1496,9 +1683,30 @@ namespace DeskFences
 
             if (_isDragSurfaceActive)
             {
-                // During rigid drag: FenceBackdropForm continuously provides the exact same frosted Liquid Glass
-                // body underneath (zero hide/show, zero double-glass flash!), while FenceChromeForm composites
-                // ONLY the transparent captured native icons at 1:1 pixel lock!
+                // When OldSlotMaskForm covers the stationary originals above SysListView32, FenceBackdropForm
+                // hides during drag and FenceChromeForm renders the exact 1x frosted glass body directly
+                // underneath the captured 32-bit ARGB icons (zero seam across overlap, zero double-glass!).
+                if (_oldSlotMaskActive && Config.BackdropOpacity > 0.01)
+                {
+                    int inset = 2;
+                    Rectangle glassRect = new Rectangle(inset, hh, Math.Max(4, w - inset * 2), Math.Max(4, h - hh - inset));
+                    int targetAlpha = Math.Max(22, Math.Min(185, (int)Math.Round((theme.BodyGlaze.A + 20) * Config.BackdropOpacity)));
+                    Color cTop = Color.FromArgb(targetAlpha, theme.TopCaustic.R, theme.TopCaustic.G, theme.TopCaustic.B);
+                    Color cMid = Color.FromArgb(targetAlpha, theme.BodyGlaze.R, theme.BodyGlaze.G, theme.BodyGlaze.B);
+                    Color cBot = Color.FromArgb(targetAlpha, theme.BottomBounce.R, theme.BottomBounce.G, theme.BottomBounce.B);
+                    using (GraphicsPath glassPath = CreateBottomRoundedPath(glassRect, Math.Max(6, cr - inset)))
+                    using (LinearGradientBrush gb = new LinearGradientBrush(glassRect, cTop, cBot, 90f))
+                    {
+                        gb.InterpolationColors = new ColorBlend(3)
+                        {
+                            Colors = new[] { cTop, cMid, cBot },
+                            Positions = new[] { 0.0f, 0.35f, 1.0f }
+                        };
+                        g.FillPath(gb, glassPath);
+                        using (Brush frostMist = new SolidBrush(Color.FromArgb(Math.Max(2, targetAlpha / 18), 255, 255, 255)))
+                            g.FillPath(frostMist, glassPath);
+                    }
+                }
                 if (_dragNativeIconsLayer != null)
                 {
                     using (GraphicsPath bodyPath = CreateBottomRoundedPath(new Rectangle(1, hh, w - 2, Math.Max(2, h - hh - 1)), Math.Max(6, cr - 1)))
@@ -2080,7 +2288,7 @@ namespace DeskFences
             Point target = MonitorGrid.ClampOrigin(area, desired, size);
             if (_lastDragCandidate == target)
             {
-                PumpAnimationIfDue(false);
+                PumpAnimationIfDue();
                 return;
             }
             _lastDragCandidate = target;
@@ -2327,18 +2535,15 @@ namespace DeskFences
             StopAnimTimer();
 
             var captured = _capturedMembers;
-            var dimmed = _dimmedMemberIndices;
             Rectangle oldBounds = _dragStartBounds;
             bool relocated = _dragRelocated;
             Rectangle[] workAreas = _dragWorkAreas;
             _capturedMembers = null;
-            _dimmedMemberIndices = null;
             _dragStartBounds = Rectangle.Empty;
             _dragRelocated = false;
             _lastDragCandidate = null;
             _dragWorkAreas = null;
             _dragSessionSeq++;
-            bool hasDimmed = dimmed != null && dimmed.Count > 0;
             bool moved = Config.OuterCol != _dragStartOuterCol || Config.OuterRow != _dragStartOuterRow;
 
             try
@@ -2362,7 +2567,7 @@ namespace DeskFences
                     bool sizeChanged = Bounds.Width != _animTargetBounds.Width || Bounds.Height != _animTargetBounds.Height;
                     Bounds = _animTargetBounds;
                     if (sizeChanged) RedrawLayeredSurface();
-                    SyncBackdrop();
+                    if (!_oldSlotMaskActive) SyncBackdrop();
                 }
 
                 // After an overlap recovery / spring glide, let DWM latch the final stopped glass
@@ -2373,11 +2578,9 @@ namespace DeskFences
                     try { NativeMethods.DwmFlush(); } catch { }
                 }
 
-                // Zero-flash DWM-synchronized handoff:
-                // Use CanCommitToCurrentDesktop() (NOT DesktopReady!) so exiting or display/wallpaper
-                // changes mid-drag ALWAYS clear LVIS_CUT dimming cleanly!
+                // Zero-flash DWM-synchronized handoff: move icons ONCE directly from old cells -> target cells!
                 bool snapRestored = false;
-                if ((hasDimmed || moved) && _manager.CanCommitToCurrentDesktop())
+                if (moved && _manager.CanCommitToCurrentDesktop())
                 {
                     bool committed = _manager.CommitRigidDragDrop(
                         this, captured, _dragMetrics, workAreas,
@@ -2385,7 +2588,6 @@ namespace DeskFences
                         Config.OuterCol, Config.OuterRow,
                         applyIconPositions && enforce,
                         oldBounds,
-                        dimmed,
                         out snapRestored);
                     if (!committed)
                     {
@@ -2396,12 +2598,13 @@ namespace DeskFences
                         if (!Disposing && !IsDisposed && Bounds != _animTargetBounds)
                         {
                             Bounds = _animTargetBounds;
-                            SyncBackdrop();
+                            if (!_oldSlotMaskActive) SyncBackdrop();
                         }
                     }
                 }
 
-                // 2. Wait for DWM to ingest & present Explorer's synchronously painted frame when icons moved.
+                // 2. Wait for DWM to ingest & present Explorer's synchronously painted frame when icons moved
+                //    (so old cells are already empty wallpaper and new cells already show the crisp real icons!).
                 if (!Disposing && !IsDisposed && _isDragSurfaceActive && _dragNativeIconsLayer != null && moved)
                 {
                     int minFlushes = (relocated || snapRestored) ? 4 : 2;
@@ -2420,7 +2623,8 @@ namespace DeskFences
                     catch { }
                 }
 
-                // 3. Immediately clear the drag icon overlay back to Alpha==0.
+                // 3. Atomically restore FenceBackdropForm underneath, clear drag overlay back to Alpha==0,
+                //    and hide OldSlotMaskForm!
                 _isDragOverlapping = false;
                 ExitRigidDragSurface();
                 if (_dragPerfWatch.IsRunning)
@@ -2653,6 +2857,13 @@ namespace DeskFences
                     _renamePopup = null;
                 }
                 if (_titleFont != null) _titleFont.Dispose();
+                if (_oldSlotMask != null && !_oldSlotMask.IsDisposed)
+                {
+                    _oldSlotMask.HideMask();
+                    _oldSlotMask.Close();
+                    _oldSlotMask.Dispose();
+                    _oldSlotMask = null;
+                }
                 if (Backdrop != null && !Backdrop.IsDisposed)
                 {
                     Backdrop.Close();
