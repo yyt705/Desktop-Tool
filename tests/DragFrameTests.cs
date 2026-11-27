@@ -64,8 +64,10 @@ namespace DeskFences
             internal readonly Timer Animation = new Timer();
             internal readonly Dictionary<string, FenceChromeForm> Forms = new Dictionary<string, FenceChromeForm>();
 
-            internal Fixture(string[] paths, bool snap, int[] customColumns = null, int[] customRows = null)
+            internal Fixture(string[] paths, bool snap, int[] customColumns = null, int[] customRows = null, Size? hostSize = null, Rectangle[] workAreas = null)
             {
+                if (hostSize.HasValue)
+                    Host.Bounds = new Rectangle(0, 0, hostSize.Value.Width, hostSize.Value.Height);
                 View = new PrivateDesktopView(paths);
                 Host.Controls.Add(Panel);
                 Panel.Controls.Add(View);
@@ -73,7 +75,7 @@ namespace DeskFences
                 View.SetSnap(false);
                 const int setIconSpacing = 0x1000 + 53;
                 NativeMethods.SendMessage(View.Handle, setIconSpacing, IntPtr.Zero, new IntPtr(Cell | (Cell << 16)));
-                View.SetWorkArea(new Rectangle(0, 0, 1280, 500));
+                View.SetWorkAreas(workAreas ?? new[] { new Rectangle(0, 0, Host.Width, Host.Height) });
                 int[] columns = customColumns ?? new[] { 1, 2, 7, 8 };
                 int[] rows = customRows ?? new[] { 1, 1, 1, 1 };
                 for (int i = 0; i < paths.Length; ++i)
@@ -235,6 +237,10 @@ namespace DeskFences
                         {
                             Point expected = icons[i].ClientPosition;
                             if (i < 2) expected.Offset(delta);
+                            int cutState = (int)NativeMethods.SendMessage(f.View.Handle, NativeMethods.LVM_GETITEMSTATE,
+                                new IntPtr(i), new IntPtr(NativeMethods.LVIS_CUT));
+                            Check((cutState & NativeMethods.LVIS_CUT) == 0,
+                                phase + " left LVIS_CUT dimmed state set on native item " + i + " at rest!");
                             Check(f.View.Items[i].Position == expected && f.View.Items[i].Selected == (i == 0 || i == 2),
                                 phase + " changed native item " + i + " position or selection. Expected " + expected + ", observed " + f.View.Items[i].Position);
                         }
@@ -267,7 +273,8 @@ namespace DeskFences
 
                     // 2. Real drag past threshold: stays strictly snapped to the desktop grid with prompt
                     //    first-step response (~0.22 cell) and positive hysteresis (zero back-and-forth
-                    //    oscillation at ANY pixel!) while parking members offscreen.
+                    //    oscillation at ANY pixel!) while keeping real icons strictly stationary (NO offscreen parking!).
+                    int snapBeforeDrag = f.View.SnapChanges;
                     f.View.DirectPositions.Clear();
                     press();
                     // Verify prompt first step: moving just 0.25 cell immediately steps onto col 2 (not waiting for 0.56 cell!)
@@ -321,14 +328,16 @@ namespace DeskFences
                         "Backdrop must remain continuously visible during drag so glass brightness never flashes.");
                     Check(!ChromePixels(moving, bodyArea).SequenceEqual(clearBody),
                         "Rigid drag layer must composite the captured icons cleanly.");
-                    Rectangle visibleHost = new Rectangle(0, 0, f.Host.Width, f.Host.Height);
-                    foreach (var pos in f.View.DirectPositions)
-                    {
-                        Check(!visibleHost.Contains(pos.Value),
-                            "Parking member icon " + pos.Key + " splashed visibly onto desktop workarea at " + pos.Value + "!");
-                    }
+                    Check(f.View.DirectPositions.Count == 0,
+                        "Dragging a fence must NEVER move real icons offscreen (0 LVM_SETITEMPOSITION32 calls during drag!).");
+                    Check(f.View.SnapChanges == snapBeforeDrag,
+                        "Dragging a fence must NEVER toggle LVS_EX_SNAPTOGRID during pickup/drag!");
+                    Check(f.View.Items[0].Position == icons[0].ClientPosition && f.View.Items[1].Position == icons[1].ClientPosition,
+                        "Real member icons must stay calmly at their original positions while dragging.");
+                    Check(((int)NativeMethods.SendMessage(f.View.Handle, NativeMethods.LVM_GETITEMSTATE, IntPtr.Zero, new IntPtr(NativeMethods.LVIS_CUT)) & NativeMethods.LVIS_CUT) != 0,
+                        "Stationary originals should be visually dimmed with LVIS_CUT while dragging.");
                     Check(f.View.Items[4].Position == topLeftOutsiderStart,
-                        "Parking members offscreen must NEVER push existing top-left desktop icons!");
+                        "Dragging must NEVER push existing top-left desktop icons!");
                     Check(!(bool)typeof(FenceChromeForm).GetField("_isDragOverlapping", Instance).GetValue(moving),
                         "Valid drag step must keep normal liquid glass rim.");
                     moving.MovePointer(5 * Cell, 0);
@@ -339,6 +348,8 @@ namespace DeskFences
                         "Moving beyond stationary fence must clear overlap warning rim.");
                     moving.Release();
                     finishDrop(true);
+                    Check(f.View.SnapChanges == snapBeforeDrag,
+                        "A clean drop onto free cells must not toggle LVS_EX_SNAPTOGRID at all.");
                     verifyRest(11, "After rigid drag drop");
                     Check(!moving.Capture, "A completed drop must release input capture.");
 
@@ -349,21 +360,19 @@ namespace DeskFences
                     verifyRest(0, "After capture loss recovery");
 
                     // 4. P0 regression: exiting (_exiting=true) or display/wallpaper rebind (_rebindingDesktop=true)
-                    //    mid-drag MUST still unpark and restore icons from offscreen (-5000,-5000)!
+                    //    mid-drag MUST keep icons on visible desktop AND cleanly clear LVIS_CUT dimming!
                     press();
                     moving.MovePointer(Cell, 0);
-                    Check(f.View.Items[0].Position.X < -1000 && f.View.Items[1].Position.X < -1000,
-                        "Members must be parked offscreen while dragging.");
+                    Check(f.View.Items[0].Position == icons[0].ClientPosition && f.View.Items[1].Position == icons[1].ClientPosition,
+                        "Members must stay untouched on the visible desktop during drag.");
                     Set(f.Manager, "_rebindingDesktop", true);
                     moving.SettleInteraction(true, false);
                     Set(f.Manager, "_rebindingDesktop", false);
-                    Check(visibleHost.Contains(f.View.Items[0].Position) && visibleHost.Contains(f.View.Items[1].Position),
-                        "Rebinding desktop mid-drag must STILL unpark member icons back onto visible desktop!");
+                    Check(((int)NativeMethods.SendMessage(f.View.Handle, NativeMethods.LVM_GETITEMSTATE, IntPtr.Zero, new IntPtr(NativeMethods.LVIS_CUT)) & NativeMethods.LVIS_CUT) == 0,
+                        "Rebinding desktop mid-drag must clear LVIS_CUT dimming cleanly!");
 
                     press();
                     moving.MovePointer(-Cell, 0);
-                    Check(f.View.Items[0].Position.X < -1000 && f.View.Items[1].Position.X < -1000,
-                        "Members must be parked offscreen while dragging before exit.");
                     Set(f.Manager, "_exiting", true);
                     moving.SettleInteraction(true, false);
                     Set(f.Manager, "_exiting", false);
@@ -669,6 +678,207 @@ namespace DeskFences
             }
         }
 
+        /// <summary>
+        /// Real-scale 150-icon / 30-member-fence dual-workarea anti-regression stress test:
+        /// guards against top-left desktop icon displacement, redundant full GetAllIcons() UI stalls,
+        /// overlapping 1-cell rigid moves under SnapToGrid, and post-animation snapshot poisoning.
+        /// </summary>
+        private static void CheckLargeDesktopScaleAndNoDisplacement(string dir)
+        {
+            string scaleDir = Path.Combine(dir, "scale150");
+            Directory.CreateDirectory(scaleDir);
+            const int total = 150;
+            const int memberCount = 30;
+            var paths = new string[total];
+            var cols = new int[total];
+            var rows = new int[total];
+
+            // 1. Place 30 fence member icons inside OuterCol=8..17, OuterRow=1..7 (inner cols 9..14, rows 2..6 => 6x5 = 30)
+            int idx = 0;
+            for (int r = 2; r <= 6; r++)
+            {
+                for (int c = 9; c <= 14; c++)
+                {
+                    paths[idx] = Path.Combine(scaleDir, string.Format("mem_{0:D3}.txt", idx));
+                    File.WriteAllText(paths[idx], "m" + idx);
+                    cols[idx] = c;
+                    rows[idx] = r;
+                    idx++;
+                }
+            }
+
+            // 2. Place 28 innocent top-left desktop icons filling (0,0)..(1,13) — exact layout that
+            //    (-5000,-5000) offscreen parking previously wiped & displaced on real Win11 Explorer!
+            for (int c = 0; c <= 1; c++)
+            {
+                for (int r = 0; r < 14; r++)
+                {
+                    paths[idx] = Path.Combine(scaleDir, string.Format("tl_{0:D3}.txt", idx));
+                    File.WriteAllText(paths[idx], "tl" + idx);
+                    cols[idx] = c;
+                    rows[idx] = r;
+                    idx++;
+                }
+            }
+
+            // 3. Place 2 conflicting outsider icons right below the fence at (10, 9) and (11, 9) for drop-expulsion check
+            int outsiderIdxA = idx;
+            paths[idx] = Path.Combine(scaleDir, "out_A.txt"); File.WriteAllText(paths[idx], "oa"); cols[idx] = 10; rows[idx] = 9; idx++;
+            int outsiderIdxB = idx;
+            paths[idx] = Path.Combine(scaleDir, "out_B.txt"); File.WriteAllText(paths[idx], "ob"); cols[idx] = 11; rows[idx] = 9; idx++;
+
+            // 4. Fill remaining 90 loose icons across columns 2..6 and 20..25 (safe outside fence path)
+            for (int c = 2; c <= 25 && idx < total; c++)
+            {
+                if (c >= 7 && c <= 19) continue;
+                for (int r = 0; r < 14 && idx < total; r++)
+                {
+                    paths[idx] = Path.Combine(scaleDir, string.Format("loose_{0:D3}.txt", idx));
+                    File.WriteAllText(paths[idx], "l" + idx);
+                    cols[idx] = c;
+                    rows[idx] = r;
+                    idx++;
+                }
+            }
+            Check(idx == total, "Expected 150 test items, got " + idx);
+
+            var dualWorkAreas = new[]
+            {
+                new Rectangle(0, 0, 28 * Cell, 14 * Cell),
+                new Rectangle(28 * Cell, 0, 10 * Cell, 10 * Cell)
+            };
+            using (var f = new Fixture(paths, true, cols, rows, new Size(28 * Cell, 14 * Cell), dualWorkAreas))
+            {
+                var icons = f.Controller.GetAllIcons();
+                var grid = f.Controller.GetGridMetrics(icons);
+                Check(f.Controller.SnapshotComplete && icons.Count == total && grid.SnapToGridEnabled,
+                    "150-icon dual-workarea fixture must initialize cleanly with SnapToGrid ON.");
+
+                // Prime Manager snapshot fields identically to startup
+                Set(f.Manager, "_inputSnapshot", icons);
+                Set(f.Manager, "_lastGridMetrics", grid);
+                Set(f.Manager, "_lastRawItemSpacing", f.Controller.GetRawItemSpacing());
+                Set(f.Manager, "_lastItemCount", icons.Count);
+                Set(f.Manager, "_desktopDirty", false);
+
+                var fence = new FenceConfig
+                {
+                    Title = "GNSS_ScaleTest",
+                    OuterCol = 8,
+                    OuterRow = 1,
+                    OuterCols = 8, // inner 6 cols (9..14)
+                    OuterRows = 7, // inner 5 rows (2..6)
+                    MemberIconIds = icons.Take(memberCount).Select(ic => ic.Identity).ToList()
+                };
+                f.Config.Fences.Add(fence);
+                var chrome = new Chrome(f.Manager, fence);
+                f.Forms.Add(fence.Id, chrome);
+                chrome.Show();
+
+                var initialPositions = new Point[total];
+                for (int i = 0; i < total; i++) initialPositions[i] = f.View.Items[i].Position;
+
+                // A. Steady-state periodic drift probe MUST detect 0 drift with ZERO full GetAllIcons() scans!
+                int scansBefore = f.Manager.ControllerFullScanCount;
+                Check(!f.Manager.HasPeriodicDesktopDrift(),
+                    "Unchanged 150-icon desktop must report zero periodic drift.");
+                Check(f.Manager.ControllerFullScanCount == scansBefore,
+                    "Periodic drift probe must NEVER run a full GetAllIcons() scan on an unchanged desktop!");
+
+                // External move of 1 icon MUST be detected immediately by the lightweight probe!
+                Point savedLoosePos = f.View.Items[total - 1].Position;
+                f.View.Items[total - 1].Position = new Point(savedLoosePos.X + Cell, savedLoosePos.Y);
+                Check(f.Manager.HasPeriodicDesktopDrift(),
+                    "Lightweight drift probe must detect an external icon move.");
+                f.View.Items[total - 1].Position = savedLoosePos;
+                Check(!f.Manager.HasPeriodicDesktopDrift(),
+                    "Restored icon must clear periodic drift.");
+
+                // B. Hover pre-warm + MouseDown + Drag start on 30-member fence MUST perform:
+                //    - ZERO full GetAllIcons() scans
+                //    - ZERO LVM_SETITEMPOSITION32 calls during drag
+                //    - ZERO LVS_EX_SNAPTOGRID toggles during drag
+                int snapBefore = f.View.SnapChanges;
+                scansBefore = f.Manager.ControllerFullScanCount;
+                f.View.DirectPositions.Clear();
+
+                Check(chrome.TryPreWarmDragCapture(), "Fast pre-warm must succeed on 150-icon desktop.");
+                Check(f.Manager.ControllerFullScanCount == scansBefore,
+                    "Pre-warm on 150-icon desktop must NEVER fall back to full GetAllIcons() scan!");
+
+                chrome.Press();
+                typeof(FenceChromeForm).GetField("_dragWorkAreas", Instance).SetValue(chrome,
+                    new[] { new Rectangle(0, 0, 28, 14) });
+                // 1-cell diagonal overlapping translation (+1 col, +1 row): 20 of 30 members move onto cells
+                // previously occupied by other members of the same fence!
+                chrome.MovePointer(Cell, Cell);
+                Check(f.Manager.ControllerFullScanCount == scansBefore,
+                    "Dragging 30-member fence must perform ZERO full GetAllIcons() scans! Note=" + f.Manager.LastBeginDragNote);
+                Check(f.View.DirectPositions.Count == 0,
+                    "During drag, ZERO icons may be moved via LVM_SETITEMPOSITION32!");
+                Check(f.View.SnapChanges == snapBefore,
+                    "During drag, LVS_EX_SNAPTOGRID must NEVER be toggled!");
+                for (int i = memberCount; i < total; i++)
+                {
+                    Check(f.View.Items[i].Position == initialPositions[i],
+                        "During drag, innocent non-member icon " + i + " was displaced!");
+                }
+
+                // Clean drop onto empty cells (+1 col, +1 row): topological back-to-front move MUST succeed with ZERO snap toggles!
+                chrome.Release();
+                chrome.SettleInteraction(true, true);
+                Check(f.View.SnapChanges == snapBefore,
+                    "Clean 1-cell overlapping drop of 30 members must not toggle LVS_EX_SNAPTOGRID!");
+                for (int i = 0; i < memberCount; i++)
+                {
+                    Point expected = new Point(initialPositions[i].X + Cell, initialPositions[i].Y + Cell);
+                    Check(f.View.Items[i].Position == expected,
+                        "Member " + i + " collided during 1-cell overlapping drop! Expected " + expected + ", got " + f.View.Items[i].Position);
+                    int cutState = (int)NativeMethods.SendMessage(f.View.Handle, NativeMethods.LVM_GETITEMSTATE,
+                        new IntPtr(i), new IntPtr(NativeMethods.LVIS_CUT));
+                    Check((cutState & NativeMethods.LVIS_CUT) == 0,
+                        "Member " + i + " kept LVIS_CUT after drop!");
+                }
+                for (int i = memberCount; i < total; i++)
+                {
+                    Check(f.View.Items[i].Position == initialPositions[i],
+                        "After clean drop, innocent desktop icon " + i + " (e.g. top-left) was displaced!");
+                }
+
+                // C. Drop onto conflicting outsiders at row 9 -> smooth expulsion animation ->
+                //    immediate follow-up drag MUST STILL perform ZERO full GetAllIcons() scans (no dirty poisoning)!
+                scansBefore = f.Manager.ControllerFullScanCount;
+                chrome.Press();
+                typeof(FenceChromeForm).GetField("_dragWorkAreas", Instance).SetValue(chrome,
+                    new[] { new Rectangle(0, 0, 28, 14) });
+                chrome.MovePointer(0, 2 * Cell); // OuterRow 2 -> 4 (bottom border row 10, overlaps outsiders at row 9!)
+                chrome.Release();
+                chrome.SettleInteraction(true, true);
+                Check(f.Animation.Enabled, "Conflicting outsiders at landing zone must smoothly animate out.");
+                typeof(FenceManager).GetMethod("FinishIconAnimationImmediately", Instance)
+                    .Invoke(f.Manager, new object[] { true });
+                Check(!f.Animation.Enabled, "Outsider animation must finish cleanly.");
+                Check(f.Controller.GetGridMetrics(f.Controller.GetAllIcons()).SnapToGridEnabled,
+                    "SnapToGrid must be restored after outsider animation.");
+                // Verify all 28 top-left icons (0,0)..(1,13) are STILL 100% untouched!
+                for (int i = memberCount; i < memberCount + 28; i++)
+                {
+                    Check(f.View.Items[i].Position == initialPositions[i],
+                        "Top-left icon " + i + " was displaced after drop with outsider expulsion!");
+                }
+                // Verify immediate follow-up drag hits fast path with ZERO full scans!
+                int scansAfterExpel = f.Manager.ControllerFullScanCount;
+                chrome.Press();
+                typeof(FenceChromeForm).GetField("_dragWorkAreas", Instance).SetValue(chrome,
+                    new[] { new Rectangle(0, 0, 28, 14) });
+                chrome.MovePointer(0, -Cell);
+                Check(f.Manager.ControllerFullScanCount == scansAfterExpel,
+                    "Immediate follow-up drag after outsider animation MUST hit fast path (0 full scans)! Note=" + f.Manager.LastBeginDragNote);
+                chrome.Release();
+                chrome.SettleInteraction(true, true);
+            }
+        }
+
         internal static void Run(string dir)
         {
             string config = Path.GetFullPath(AppConfig.GetConfigPath());
@@ -686,6 +896,7 @@ namespace DeskFences
                 CheckDrag(paths, true);
                 CheckBlockedDropRelocation(paths.Take(4).ToArray());
                 CheckDiagonalResize(paths.Take(4).ToArray());
+                CheckLargeDesktopScaleAndNoDisplacement(dir);
             });
         }
     }

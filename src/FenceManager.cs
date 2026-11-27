@@ -272,6 +272,7 @@ namespace DeskFences
         internal bool LastBeginDragUsedFastPath { get; private set; }
         internal string LastBeginDragNote { get; private set; }
         private long _lastFullScanMs = -10000;
+        private long _lastTopologyCheckMs = -10000;
         private int _lastItemCount = -1;
         private bool _fencesHiddenByUser;
         private bool _lastDesktopVisible = true;
@@ -1880,7 +1881,8 @@ namespace DeskFences
                 _iconAnimTracks = null;
                 _isAnimatingIcons = false;
                 ApplyTracksToInputSnapshot(finishedTracks);
-                _desktopDirty = true;
+                if (_sessionClock != null)
+                    _lastSnapshotRefreshMs = _sessionClock.ElapsedMilliseconds;
                 ReleaseFreeIconMoveModeIfIdle();
             }
         }
@@ -1889,27 +1891,30 @@ namespace DeskFences
         {
             if (tracks == null || tracks.Count == 0 || _inputSnapshot == null || _inputSnapshot.Count == 0)
                 return;
-            var deltas = new Dictionary<string, Point>(StringComparer.OrdinalIgnoreCase);
+            // Use absolute TargetPos (idempotent even if CommitRigidDragDrop already applied the shift).
+            var targets = new Dictionary<string, Point>(StringComparer.OrdinalIgnoreCase);
             foreach (var tr in tracks)
             {
-                if (string.IsNullOrEmpty(tr.IconInfo.Identity)) continue;
-                int dx = tr.TargetPos.X - tr.StartPos.X;
-                int dy = tr.TargetPos.Y - tr.StartPos.Y;
-                if (dx != 0 || dy != 0)
-                    deltas[tr.IconInfo.Identity] = new Point(dx, dy);
+                if (!string.IsNullOrEmpty(tr.IconInfo.Identity))
+                    targets[tr.IconInfo.Identity] = tr.TargetPos;
             }
-            if (deltas.Count == 0) return;
+            if (targets.Count == 0) return;
             for (int i = 0; i < _inputSnapshot.Count; i++)
             {
                 var ic = _inputSnapshot[i];
-                Point shift;
-                if (!string.IsNullOrEmpty(ic.Identity) && deltas.TryGetValue(ic.Identity, out shift))
+                Point targetPos;
+                if (!string.IsNullOrEmpty(ic.Identity) && targets.TryGetValue(ic.Identity, out targetPos))
                 {
-                    ic.ClientPosition.Offset(shift);
-                    ic.ScreenBounds.Offset(shift);
-                    ic.IconBounds.Offset(shift);
-                    ic.LabelBounds.Offset(shift);
-                    _inputSnapshot[i] = ic;
+                    int dx = targetPos.X - ic.ClientPosition.X;
+                    int dy = targetPos.Y - ic.ClientPosition.Y;
+                    if (dx != 0 || dy != 0)
+                    {
+                        ic.ClientPosition = targetPos;
+                        ic.ScreenBounds.Offset(dx, dy);
+                        ic.IconBounds.Offset(dx, dy);
+                        ic.LabelBounds.Offset(dx, dy);
+                        _inputSnapshot[i] = ic;
+                    }
                 }
             }
         }
@@ -1959,6 +1964,8 @@ namespace DeskFences
         internal int CurrentHostGeneration { get { return _controller.HostGeneration; } }
         internal long SessionElapsedMs { get { return _sessionClock.ElapsedMilliseconds; } }
         internal int GetDesktopItemCount() { return _controller.GetDesktopItemCount(); }
+        internal bool IsOutOfProcessDesktopHost() { return _controller.IsOutOfProcessHost(); }
+        internal int ControllerFullScanCount { get { return _controller.FullScanCount; } }
 
         internal bool IsDesktopListViewForeground()
         {
@@ -1968,6 +1975,10 @@ namespace DeskFences
                    (fg == _controller.DesktopOwner || fg == _controller.DefView || fg == _controller.ListView);
         }
 
+        /// <summary>
+        /// Strictly non-blocking fast member-only lookup for drag pre-warming.
+        /// NEVER runs a full desktop GetAllIcons() scan on hover or mouse-down so 130+ icon desktops never freeze.
+        /// </summary>
         internal bool TryGetLiveMembersForPreWarm(
             FenceChromeForm form,
             out List<DesktopIconInfo> members,
@@ -1987,9 +1998,7 @@ namespace DeskFences
             var memberSet = new HashSet<string>(form.Config.MemberIconIds, StringComparer.OrdinalIgnoreCase);
 
             int liveCount = _controller.GetDesktopItemCount();
-            bool snapshotFresh = !_desktopDirty || (_sessionClock.ElapsedMilliseconds - _lastSnapshotRefreshMs) <= 400;
-            if (snapshotFresh &&
-                _inputSnapshot != null && _inputSnapshot.Count > 0 &&
+            if (_inputSnapshot != null && _inputSnapshot.Count > 0 &&
                 _lastGridMetrics.CellWidth > 0 && _lastGridMetrics.CellHeight > 0 &&
                 form.Config.MemberIconNames.Count == 0 &&
                 liveCount == _inputSnapshot.Count &&
@@ -1999,8 +2008,10 @@ namespace DeskFences
                 var metrics = _controller.GetLiveStyleMetrics(_lastGridMetrics);
                 if (metrics.AutoArrangeEnabled) return false;
                 var candidates = _inputSnapshot.FindAll(item => memberSet.Contains(item.Identity));
+                if (candidates.Count == 0) return false;
+                if (_desktopDirty && candidates.Count < memberSet.Count) return false;
                 List<DesktopIconInfo> fresh;
-                if (_controller.TryRefreshIconsLive(candidates, out fresh) &&
+                if (_controller.TryRefreshIconsLive(candidates, out fresh, true) &&
                     DesktopReady && _controller.HostGeneration == generation && _controller.ListView == view)
                 {
                     UpdateInputSnapshotSubset(fresh);
@@ -2008,28 +2019,10 @@ namespace DeskFences
                     hostGen = generation;
                     itemCount = liveCount;
                     usedFastPath = true;
-                    return true;
+                    return members.Count > 0;
                 }
             }
-
-            // Fallback: full live snapshot (read-only) also primes _inputSnapshot so the upcoming drag hits the 1ms fast path!
-            var all = _controller.GetAllIcons(false);
-            var fullMetrics = _controller.GetGridMetrics(all);
-            if (!_controller.SnapshotComplete || !DesktopReady ||
-                _controller.HostGeneration != generation || _controller.ListView != view)
-                return false;
-            _inputSnapshot = all;
-            _lastGridMetrics = fullMetrics;
-            _lastRawItemSpacing = _controller.GetRawItemSpacing();
-            _lastItemCount = all.Count;
-            _lastSnapshotRefreshMs = _sessionClock.ElapsedMilliseconds;
-            if (fullMetrics.AutoArrangeEnabled) return false;
-            members = all.FindAll(item =>
-                memberSet.Contains(item.Identity) &&
-                form.Config.IsInInnerRect(item.GridCol(fullMetrics), item.GridRow(fullMetrics)));
-            hostGen = generation;
-            itemCount = all.Count;
-            return true;
+            return false;
         }
 
         private void UpdateInputSnapshotSubset(List<DesktopIconInfo> refreshed)
@@ -2048,10 +2041,20 @@ namespace DeskFences
 
         public List<DesktopIconInfo> BeginFenceDrag(FenceChromeForm form, out DesktopGridMetrics metrics)
         {
-            return BeginFenceMutation(form, true, out metrics);
+            return BeginFenceMutation(form, true, false, out metrics);
+        }
+
+        internal List<DesktopIconInfo> BeginFenceDrag(FenceChromeForm form, bool trustedRecentPreWarm, out DesktopGridMetrics metrics)
+        {
+            return BeginFenceMutation(form, true, trustedRecentPreWarm, out metrics);
         }
 
         private List<DesktopIconInfo> BeginFenceMutation(FenceChromeForm form, bool dragging, out DesktopGridMetrics metrics)
+        {
+            return BeginFenceMutation(form, dragging, false, out metrics);
+        }
+
+        private List<DesktopIconInfo> BeginFenceMutation(FenceChromeForm form, bool dragging, bool trustedRecentPreWarm, out DesktopGridMetrics metrics)
         {
             metrics = new DesktopGridMetrics();
             if (!DesktopReady || _isMutatingFence) return null;
@@ -2071,14 +2074,13 @@ namespace DeskFences
                 LastBeginDragUsedFastPath = false;
                 LastBeginDragNote = "full";
 
-                // Fast member-only live path on drag pickup: skips scanning all 50-100 non-member desktop icons
-                // while still reading 100% live ClientPosition / ScreenBounds / IconBounds / LabelBounds / Selected
-                // and verifying each member's ListView index & PIDL identity!
-                bool snapshotFresh = !_desktopDirty || (_sessionClock.ElapsedMilliseconds - _lastSnapshotRefreshMs) <= 400;
+                // Fast member-only live path on drag pickup: skips scanning all 100+ non-member desktop icons
+                // while reading live ClientPosition / Selected (and bounds/PIDL when needed). Works even if
+                // _desktopDirty was set by a prior drop/animation as long as desktop item count & spacing match
+                // and every member verifies live!
                 if (dragging)
                 {
-                    if (!snapshotFresh) LastBeginDragNote = "dirty";
-                    else if (_inputSnapshot == null || _inputSnapshot.Count == 0) LastBeginDragNote = "noSnap";
+                    if (_inputSnapshot == null || _inputSnapshot.Count == 0) LastBeginDragNote = "noSnap";
                     else if (_lastGridMetrics.CellWidth <= 0 || _lastGridMetrics.CellHeight <= 0) LastBeginDragNote = "noGrid";
                     else if (form.Config.MemberIconNames.Count != 0) LastBeginDragNote = "legacyNames";
                     else if (_controller.GetDesktopItemCount() != _inputSnapshot.Count) LastBeginDragNote = "lvCount";
@@ -2102,22 +2104,29 @@ namespace DeskFences
                         }
 
                         var candidates = _inputSnapshot.FindAll(item => memberSet.Contains(item.Identity));
-                        List<DesktopIconInfo> freshMembers;
-                        if (_controller.TryRefreshIconsLive(candidates, out freshMembers) &&
-                            DesktopReady && _controller.HostGeneration == generation && _controller.ListView == view)
+                        if (_desktopDirty && candidates.Count < memberSet.Count)
                         {
-                            UpdateInputSnapshotSubset(freshMembers);
-                            var fastGrid = metrics;
-                            var fastCaptured = freshMembers.FindAll(item =>
-                                form.Config.IsInInnerRect(item.GridCol(fastGrid), item.GridRow(fastGrid)));
-                            _dragDesktop = _inputSnapshot;
-                            _canMoveMembers = true;
-                            LastBeginDragUsedFastPath = true;
-                            LastBeginDragNote = "fast";
-                            started = true;
-                            return fastCaptured;
+                            LastBeginDragNote = "missingMember";
                         }
-                        LastBeginDragNote = "verifyFail";
+                        else
+                        {
+                            List<DesktopIconInfo> freshMembers;
+                            if (_controller.TryRefreshIconsLive(candidates, out freshMembers, !trustedRecentPreWarm) &&
+                                DesktopReady && _controller.HostGeneration == generation && _controller.ListView == view)
+                            {
+                                UpdateInputSnapshotSubset(freshMembers);
+                                var fastGrid = metrics;
+                                var fastCaptured = freshMembers.FindAll(item =>
+                                    form.Config.IsInInnerRect(item.GridCol(fastGrid), item.GridRow(fastGrid)));
+                                _dragDesktop = _inputSnapshot;
+                                _canMoveMembers = true;
+                                LastBeginDragUsedFastPath = true;
+                                LastBeginDragNote = trustedRecentPreWarm ? "fastWarm" : "fast";
+                                started = true;
+                                return fastCaptured;
+                            }
+                            LastBeginDragNote = "verifyFail";
+                        }
                     }
                 }
 
@@ -2175,25 +2184,24 @@ namespace DeskFences
             return DesktopReady ? _controller.ListView : IntPtr.Zero;
         }
 
-        internal bool ParkDragMembers(List<DesktopIconInfo> members, bool snapEnabled, Rectangle dirtyScreenRect)
+        internal List<int> DimDragMembers(List<DesktopIconInfo> members, out DesktopIconController.DimTiming timing)
         {
-            DesktopIconController.ParkTiming unused;
-            return ParkDragMembers(members, snapEnabled, dirtyScreenRect, out unused);
+            timing = new DesktopIconController.DimTiming();
+            if (!CanCommitToCurrentDesktop() || !_isMutatingFence || members == null || members.Count == 0)
+                return null;
+            var sw = Stopwatch.StartNew();
+            var dimmed = _controller.SetMembersCutState(members, true);
+            timing.DimMs = sw.Elapsed.TotalMilliseconds;
+            timing.DimmedCount = dimmed != null ? dimmed.Count : 0;
+            return dimmed;
         }
 
-        internal bool ParkDragMembers(List<DesktopIconInfo> members, bool snapEnabled, Rectangle dirtyScreenRect,
-            out DesktopIconController.ParkTiming timing)
+        internal void RestoreDimmedDragMembers(List<DesktopIconInfo> members, List<int> dimmedIndices, Rectangle dirtyScreenRect)
         {
-            timing = new DesktopIconController.ParkTiming();
-            if (!CanCommitToCurrentDesktop() || !_isMutatingFence || members == null || members.Count == 0) return false;
-            bool parked = _controller.ParkIconsOffscreen(members, snapEnabled, out timing);
-            if (parked)
-            {
-                var sw = Stopwatch.StartNew();
+            if (dimmedIndices == null || dimmedIndices.Count == 0 || !CanCommitToCurrentDesktop()) return;
+            _controller.SetMembersCutState(null, false, dimmedIndices);
+            if (!dirtyScreenRect.IsEmpty)
                 _controller.FlushDesktopMemberRects(members, dirtyScreenRect);
-                timing.FlushPaintMs = sw.Elapsed.TotalMilliseconds;
-            }
-            return parked;
         }
 
         internal bool CommitRigidDragDrop(
@@ -2204,13 +2212,19 @@ namespace DeskFences
             int startCol, int startRow,
             int targetCol, int targetRow,
             bool clearOutsiders,
+            Rectangle oldFenceBounds,
+            List<int> dimmedIndices,
             out bool snapRestored)
         {
             snapRestored = false;
             _pendingDropOutsiderTracks = null;
             _pendingDropSnapEnabled = false;
             if (!CanCommitToCurrentDesktop() || !_isMutatingFence || !_canMoveMembers || form == null)
+            {
+                if (dimmedIndices != null && dimmedIndices.Count > 0 && CanCommitToCurrentDesktop())
+                    _controller.SetMembersCutState(null, false, dimmedIndices);
                 return false;
+            }
 
             int dCol = targetCol - startCol;
             int dRow = targetRow - startRow;
@@ -2225,29 +2239,59 @@ namespace DeskFences
             _controller.SetListViewRedraw(false);
             try
             {
-                // 1. Plan smooth glide tracks for any conflicting outsiders in the landing zone
-                //    (keeping LVS_EX_SNAPTOGRID suspended so they glide smoothly instead of teleporting!).
-                if (clearOutsiders && (dCol != 0 || dRow != 0) && _dragDesktop != null && _controller.HasShellItemCount(_dragDesktop.Count))
+                // 0. Always clear visual LVIS_CUT dimming inside WM_SETREDRAW(false) so icons return at 100% opacity cleanly.
+                if (dimmedIndices != null && dimmedIndices.Count > 0)
+                    _controller.SetMembersCutState(null, false, dimmedIndices);
+
+                // 1. Plan smooth glide tracks for any conflicting outsiders in the landing zone BEFORE moving members!
+                if (clearOutsiders && (dCol != 0 || dRow != 0))
                 {
-                    bool blocked;
-                    plannedOutsidersFromSnapshot = TryPlanLandingOutsidersFromSnapshot(
-                        form, capturedMembers, _dragDesktop, grid, workAreas, targetCol, targetRow, dCol, dRow,
-                        outsiderTracks, expelledUpdates, out blocked);
-                    if (blocked)
+                    if (_dragDesktop != null && _controller.HasShellItemCount(_dragDesktop.Count))
                     {
-                        committed = false;
-                        outsiderTracks.Clear();
-                        expelledUpdates.Clear();
-                        dCol = 0; dRow = 0; dx = 0; dy = 0;
+                        bool blocked;
+                        plannedOutsidersFromSnapshot = TryPlanLandingOutsidersFromSnapshot(
+                            form, capturedMembers, _dragDesktop, grid, workAreas, targetCol, targetRow, dCol, dRow,
+                            outsiderTracks, expelledUpdates, out blocked);
+                        if (blocked)
+                        {
+                            committed = false;
+                            outsiderTracks.Clear();
+                            expelledUpdates.Clear();
+                            dCol = 0; dRow = 0; dx = 0; dy = 0;
+                        }
+                    }
+
+                    // Fallback outsider check if desktop item count changed mid-drag (e.g., file created during drag)
+                    if (committed && !plannedOutsidersFromSnapshot)
+                    {
+                        var all = _controller.GetAllIcons(true);
+                        if (_controller.SnapshotComplete)
+                        {
+                            bool blocked;
+                            PlanLandingOutsiders(form, capturedMembers, all, grid, workAreas, targetCol, targetRow, dCol, dRow,
+                                outsiderTracks, expelledUpdates, out blocked);
+                            if (blocked)
+                            {
+                                committed = false;
+                                outsiderTracks.Clear();
+                                expelledUpdates.Clear();
+                                dCol = 0; dRow = 0; dx = 0; dy = 0;
+                            }
+                        }
                     }
                 }
 
-                // 2. Restore parked member icons. Only use LVM_SETITEMPOSITION32 by index when every
-                //    member's ListView index is verified unchanged; otherwise use PIDL-only IFolderView
-                //    so a mid-drag file add/delete can NEVER teleport an unrelated desktop icon!
-                if (capturedMembers != null && capturedMembers.Count > 0)
+                // 2. Move member icons directly from old cells -> new cells ONLY when the fence actually moved!
+                //    - When outsiders occupy target cells (outsiderTracks.Count > 0), suspend LVS_EX_SNAPTOGRID so
+                //      members land cleanly while outsiders smoothly glide out afterward.
+                //    - On clean drops (outsiderTracks.Count == 0), topological back-to-front ordering along (dx, dy)
+                //      guarantees every destination cell is vacant before each icon moves, avoiding any snap toggle!
+                if (capturedMembers != null && capturedMembers.Count > 0 && (dCol != 0 || dRow != 0))
                 {
-                    var ordered = (capturedMembers.Count > 1 && (dx != 0 || dy != 0))
+                    if (outsiderTracks.Count > 0 && grid.SnapToGridEnabled)
+                        _controller.SuspendSnapToGrid();
+
+                    var ordered = capturedMembers.Count > 1
                         ? capturedMembers.OrderByDescending(m => (long)m.ClientPosition.X * dx + (long)m.ClientPosition.Y * dy).ToList()
                         : capturedMembers;
                     var directMoves = new List<KeyValuePair<int, Point>>(ordered.Count);
@@ -2263,20 +2307,8 @@ namespace DeskFences
                     _controller.MoveIconsBatch(pidlMoves);
                 }
 
-                // 3. Fallback outsider check if desktop item count changed mid-drag (e.g., file created during drag)
-                if (committed && clearOutsiders && (dCol != 0 || dRow != 0) && !plannedOutsidersFromSnapshot)
-                {
-                    var all = _controller.GetAllIcons(true);
-                    if (_controller.SnapshotComplete)
-                    {
-                        bool blocked;
-                        PlanLandingOutsiders(form, capturedMembers, all, grid, workAreas, targetCol, targetRow, dCol, dRow,
-                            outsiderTracks, expelledUpdates, out blocked);
-                    }
-                }
-
-                // 4. If outsiders will smoothly glide out right after handoff, keep SnapToGrid suspended
-                //    until the slide animation completes; otherwise restore SnapToGrid inside WM_SETREDRAW(false).
+                // 3. If outsiders will smoothly glide out right after handoff, keep SnapToGrid suspended
+                //    until the slide animation completes; otherwise ensure SnapToGrid is restored inside WM_SETREDRAW(false).
                 if (outsiderTracks.Count > 0 && !_exiting)
                 {
                     _pendingDropOutsiderTracks = outsiderTracks;
@@ -2299,9 +2331,8 @@ namespace DeskFences
                 _controller.SetListViewRedraw(true);
             }
 
-            // Update known cells AND _inputSnapshot so an immediate follow-up manual icon drag
-            // (<350ms after dropping the fence) sees the icons' updated coordinates.
-            if (capturedMembers != null)
+            // Update known cells AND _inputSnapshot so an immediate follow-up drag sees exact updated coordinates.
+            if (capturedMembers != null && (dCol != 0 || dRow != 0))
             {
                 var movedMap = new Dictionary<string, Point>(StringComparer.OrdinalIgnoreCase);
                 foreach (var mem in capturedMembers)
@@ -2335,8 +2366,15 @@ namespace DeskFences
                 }
             }
 
-            _controller.FlushDesktopPaint(form.Bounds);
-            _lastDropClean = committed && outsiderTracks.Count == 0 && ((dCol == 0 && dRow == 0) || plannedOutsidersFromSnapshot);
+            if (dCol != 0 || dRow != 0)
+            {
+                _controller.FlushDesktopPaint(form.Bounds, oldFenceBounds.IsEmpty ? null : new[] { oldFenceBounds });
+            }
+            else if (dimmedIndices != null && dimmedIndices.Count > 0)
+            {
+                _controller.FlushDesktopMemberRects(capturedMembers, oldFenceBounds.IsEmpty ? form.Bounds : oldFenceBounds);
+            }
+            _lastDropClean = committed && ((dCol == 0 && dRow == 0) || plannedOutsidersFromSnapshot);
             return committed;
         }
 
@@ -2504,10 +2542,12 @@ namespace DeskFences
                 _dragDesktop = null;
                 _canMoveMembers = false;
                 _isMutatingFence = false;
-                bool cleanDrop = _lastDropClean && !enforce && (pendingTracks == null || pendingTracks.Count == 0);
+                bool cleanDrop = _lastDropClean && !enforce;
                 _lastDropClean = false;
                 if (!cleanDrop)
                     _desktopDirty = true;
+                else if (_sessionClock != null)
+                    _lastSnapshotRefreshMs = _sessionClock.ElapsedMilliseconds;
                 if (pendingTracks != null && pendingTracks.Count > 0 && CanCommitToCurrentDesktop())
                 {
                     if (!_exiting)
@@ -2575,16 +2615,19 @@ namespace DeskFences
                 _controller.InvalidateIdentityCache();
             }
 
-            bool periodicRefresh = (nowMs - _lastFullScanMs) >= 3000;
-            if (periodicRefresh && _lastGridMetrics.CellWidth > 0 && !string.IsNullOrEmpty(_lastAppliedProfileKey))
+            if ((nowMs - _lastTopologyCheckMs) >= 3000)
             {
-                // Catch silent monitor/work-area/RDP topology changes even if SystemEvents didn't fire.
-                var curAreas = MonitorGrid.GetAreas(_lastGridMetrics);
-                var matched = DisplayProfileManager.FindMatchingProfile(Config, curAreas);
-                if (matched == null || !string.Equals(matched.Key, _lastAppliedProfileKey, StringComparison.OrdinalIgnoreCase))
+                _lastTopologyCheckMs = nowMs;
+                if (_lastGridMetrics.CellWidth > 0 && !string.IsNullOrEmpty(_lastAppliedProfileKey))
                 {
-                    ScheduleDebouncedDisplaySwitch();
-                    return;
+                    // Catch silent monitor/work-area/RDP topology changes even if SystemEvents didn't fire.
+                    var curAreas = MonitorGrid.GetAreas(_lastGridMetrics);
+                    var matched = DisplayProfileManager.FindMatchingProfile(Config, curAreas);
+                    if (matched == null || !string.Equals(matched.Key, _lastAppliedProfileKey, StringComparison.OrdinalIgnoreCase))
+                    {
+                        ScheduleDebouncedDisplaySwitch();
+                        return;
+                    }
                 }
             }
 
@@ -2594,11 +2637,27 @@ namespace DeskFences
                 || _recentContextPlacements.Count > 0
                 || (!string.IsNullOrEmpty(_externalDropFenceId) && _externalDropMs >= 0 && (nowMs - _externalDropMs) <= 2000)
                 || (!string.IsNullOrEmpty(_recentRightClickFenceId) && _recentRightClickMs >= 0 && (nowMs - _recentRightClickMs) <= 12000);
-            if (!_desktopDirty && !activeTracking && !periodicRefresh)
-                return;
+            bool periodicCheck = (nowMs - _lastFullScanMs) >= 10000;
+            if (!_desktopDirty && !activeTracking)
+            {
+                if (!periodicCheck) return;
+                // Cheap O(N) position-only probe (~2-4ms, zero COM / zero CreateFile): only run a full
+                // GetAllIcons()+EnforceAllRules scan if spacing changed or at least one icon actually moved!
+                if (!HasPeriodicDesktopDrift())
+                {
+                    _lastFullScanMs = nowMs;
+                    return;
+                }
+            }
 
-            if (periodicRefresh) _controller.InvalidateIdentityCache();
             EnforceAllRules(true, true);
+        }
+
+        internal bool HasPeriodicDesktopDrift()
+        {
+            if (_inputSnapshot == null || _inputSnapshot.Count == 0) return true;
+            if (_controller.GetRawItemSpacing() != _lastRawItemSpacing) return true;
+            return _controller.HasAnyItemPositionChanged(_inputSnapshot);
         }
 
         /// <summary>

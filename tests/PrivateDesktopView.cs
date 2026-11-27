@@ -101,12 +101,22 @@ namespace DeskFences
 
         internal void SetWorkArea(Rectangle rect)
         {
-            var wa = new NativeMethods.RECT { Left = rect.Left, Top = rect.Top, Right = rect.Right, Bottom = rect.Bottom };
-            IntPtr ptr = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(NativeMethods.RECT)));
+            SetWorkAreas(new[] { rect });
+        }
+
+        internal void SetWorkAreas(Rectangle[] rects)
+        {
+            if (rects == null || rects.Length == 0) return;
+            int sz = Marshal.SizeOf(typeof(NativeMethods.RECT));
+            IntPtr ptr = Marshal.AllocHGlobal(sz * rects.Length);
             try
             {
-                Marshal.StructureToPtr(wa, ptr, false);
-                NativeMethods.SendMessage(Handle, 0x1041, new IntPtr(1), ptr); // LVM_SETWORKAREAS
+                for (int i = 0; i < rects.Length; i++)
+                {
+                    var wa = new NativeMethods.RECT { Left = rects[i].Left, Top = rects[i].Top, Right = rects[i].Right, Bottom = rects[i].Bottom };
+                    Marshal.StructureToPtr(wa, IntPtr.Add(ptr, i * sz), false);
+                }
+                NativeMethods.SendMessage(Handle, 0x1041, new IntPtr(rects.Length), ptr); // LVM_SETWORKAREAS
             }
             finally { Marshal.FreeHGlobal(ptr); }
         }

@@ -48,6 +48,7 @@ namespace DeskFences
         public const int LVM_GETITEMRECT = LVM_FIRST + 14;
         public const int LVM_GETITEMPOSITION = LVM_FIRST + 16;
         public const int LVM_GETEDITCONTROL = LVM_FIRST + 24;
+        public const int LVM_SETITEMSTATE = LVM_FIRST + 43;
         public const int LVM_GETITEMSTATE = LVM_FIRST + 44;
         public const int LVM_SETITEMPOSITION32 = LVM_FIRST + 49;
         public const int LVM_GETITEMSPACING = LVM_FIRST + 51;
@@ -62,6 +63,7 @@ namespace DeskFences
         public const uint LVIF_TEXT = 0x0001;
         public const uint LVIF_STATE = 0x0008;
         public const uint LVIS_SELECTED = 0x0002;
+        public const uint LVIS_CUT = 0x0004;
         public const int LVS_AUTOARRANGE = 0x0100;
         public const int LVS_EX_SNAPTOGRID = 0x00080000;
 
@@ -1503,12 +1505,47 @@ namespace DeskFences
             return cached;
         }
 
-        internal bool TryRefreshIconsLive(List<DesktopIconInfo> cachedSubset, out List<DesktopIconInfo> freshSubset)
+        internal bool IsOutOfProcessHost()
+        {
+            return _hostPid != 0 && _hostPid != (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+        }
+
+        internal int FullScanCount { get; private set; }
+
+        internal bool HasAnyItemPositionChanged(List<DesktopIconInfo> snapshot)
+        {
+            if (snapshot == null || !HasCurrentHandles()) return true;
+            int count = GetDesktopItemCount();
+            if (count != snapshot.Count) return true;
+            if (count == 0) return false;
+
+            int ptSize = Marshal.SizeOf(typeof(NativeMethods.POINT));
+            if (!EnsureRemoteBuffer(ptSize)) return true;
+
+            IntPtr hProc = _hProc;
+            IntPtr remoteMem = _remoteMem;
+            IntPtr localMem = _localMem;
+            for (int i = 0; i < count; i++)
+            {
+                if (NativeMethods.SendMessage(ListView, NativeMethods.LVM_GETITEMPOSITION, new IntPtr(i), remoteMem) == IntPtr.Zero)
+                    return true;
+                UIntPtr readBytes;
+                if (!NativeMethods.ReadProcessMemory(hProc, remoteMem, localMem, (UIntPtr)ptSize, out readBytes))
+                    return true;
+                var pt = (NativeMethods.POINT)Marshal.PtrToStructure(localMem, typeof(NativeMethods.POINT));
+                Point prev = snapshot[i].ClientPosition;
+                if (pt.X != prev.X || pt.Y != prev.Y)
+                    return true;
+            }
+            return false;
+        }
+
+        internal bool TryRefreshIconsLive(List<DesktopIconInfo> cachedSubset, out List<DesktopIconInfo> freshSubset, bool verifyPidl = true)
         {
             freshSubset = new List<DesktopIconInfo>();
             if (!HasCurrentHandles() || cachedSubset == null) return false;
             if (cachedSubset.Count == 0) return true;
-            if (!_shellView.Connect()) return false;
+            if (verifyPidl && !_shellView.Connect()) return false;
 
             int count = GetDesktopItemCount();
             if (count <= 0) return false;
@@ -1543,17 +1580,29 @@ namespace DeskFences
                         return false;
                     var pt = (NativeMethods.POINT)Marshal.PtrToStructure(localMem, typeof(NativeMethods.POINT));
                     Point clientPos = new Point(pt.X, pt.Y);
+                    bool moved = clientPos != item.ClientPosition;
 
-                    if (!_shellView.VerifyItemAt(item.Index, clientPos, item.Identity, resolveId))
-                        return false;
+                    if (verifyPidl || moved)
+                    {
+                        if (!_shellView.Connect() || !_shellView.VerifyItemAt(item.Index, clientPos, item.Identity, resolveId))
+                            return false;
+                    }
 
-                    var nativeBounds = ReadItemRect(ListView, hProc, remoteMem, localMem, item.Index, NativeMethods.LVIR_BOUNDS, lvOrigin);
-                    var nativeIcon = ReadItemRect(ListView, hProc, remoteMem, localMem, item.Index, NativeMethods.LVIR_ICON, lvOrigin);
-                    var nativeLabel = ReadItemRect(ListView, hProc, remoteMem, localMem, item.Index, NativeMethods.LVIR_LABEL, lvOrigin);
-                    Rectangle screenRect = nativeBounds ?? new Rectangle(pt.X + lvOrigin.X, pt.Y + lvOrigin.Y, 72, 86);
-                    Rectangle iconRect = nativeIcon ?? new Rectangle(screenRect.X + 12, screenRect.Y + 4, 48, 48);
-                    Rectangle labelRect = nativeLabel ?? new Rectangle(screenRect.X, iconRect.Bottom + 2,
-                        screenRect.Width, Math.Max(20, screenRect.Bottom - iconRect.Bottom));
+                    Rectangle screenRect = item.ScreenBounds;
+                    Rectangle iconRect = item.IconBounds;
+                    Rectangle labelRect = item.LabelBounds;
+                    bool estimated = item.EstimatedBounds;
+                    if (moved || estimated || screenRect.Width <= 0 || screenRect.Height <= 0)
+                    {
+                        var nativeBounds = ReadItemRect(ListView, hProc, remoteMem, localMem, item.Index, NativeMethods.LVIR_BOUNDS, lvOrigin);
+                        var nativeIcon = ReadItemRect(ListView, hProc, remoteMem, localMem, item.Index, NativeMethods.LVIR_ICON, lvOrigin);
+                        var nativeLabel = ReadItemRect(ListView, hProc, remoteMem, localMem, item.Index, NativeMethods.LVIR_LABEL, lvOrigin);
+                        screenRect = nativeBounds ?? new Rectangle(pt.X + lvOrigin.X, pt.Y + lvOrigin.Y, 72, 86);
+                        iconRect = nativeIcon ?? new Rectangle(screenRect.X + 12, screenRect.Y + 4, 48, 48);
+                        labelRect = nativeLabel ?? new Rectangle(screenRect.X, iconRect.Bottom + 2,
+                            screenRect.Width, Math.Max(20, screenRect.Bottom - iconRect.Bottom));
+                        estimated = !nativeBounds.HasValue || !nativeIcon.HasValue || !nativeLabel.HasValue;
+                    }
 
                     int state = (int)NativeMethods.SendMessage(ListView, NativeMethods.LVM_GETITEMSTATE,
                         new IntPtr(item.Index), new IntPtr(NativeMethods.LVIS_SELECTED));
@@ -1564,7 +1613,7 @@ namespace DeskFences
                     updated.ScreenBounds = screenRect;
                     updated.IconBounds = iconRect;
                     updated.LabelBounds = labelRect;
-                    updated.EstimatedBounds = !nativeBounds.HasValue || !nativeIcon.HasValue || !nativeLabel.HasValue;
+                    updated.EstimatedBounds = estimated;
                     freshSubset.Add(updated);
                 }
                 return true;
@@ -1827,6 +1876,7 @@ namespace DeskFences
 
         public List<DesktopIconInfo> GetAllIcons(bool refreshIdentities = false)
         {
+            FullScanCount++;
             var result = new List<DesktopIconInfo>();
             SnapshotComplete = false;
             if (!HasCurrentHandles()) return result;
@@ -2095,103 +2145,60 @@ namespace DeskFences
             return true;
         }
 
-        internal struct ParkTiming
+        /// <summary>
+        /// Sets or clears LVIS_CUT (translucent "in-transit" ghost state) on member items purely visually,
+        /// without touching item coordinates or LVS_EX_SNAPTOGRID so Explorer can NEVER displace desktop icons.
+        /// When cut==true, skips items already marked LVIS_CUT by the user's own Ctrl+X and returns only indices we changed.
+        /// </summary>
+        internal List<int> SetMembersCutState(List<DesktopIconInfo> members, bool cut, List<int> indicesToClear = null)
         {
-            public double SuspendSnapMs;
-            public double MoveMs;
-            public double VerifyMs;
-            public double FlushPaintMs;
-        }
+            var changed = new List<int>();
+            if (!HasCurrentHandles()) return changed;
+            int count = GetDesktopItemCount();
+            if (count <= 0) return changed;
 
-        public bool ParkIconsOffscreen(List<DesktopIconInfo> members, bool snapEnabled = true)
-        {
-            ParkTiming unused;
-            return ParkIconsOffscreen(members, snapEnabled, out unused);
-        }
+            int lvItemSize = Marshal.SizeOf(typeof(NativeMethods.LVITEM64));
+            if (!EnsureRemoteBuffer(lvItemSize + 16)) return changed;
 
-        internal bool ParkIconsOffscreen(List<DesktopIconInfo> members, bool snapEnabled, out ParkTiming timing)
-        {
-            timing = new ParkTiming();
-            if (members == null || members.Count == 0) return true;
-            if (!HasCurrentHandles()) return false;
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            Point lvOrigin = GetListViewScreenOrigin();
-            Rectangle vs = System.Windows.Forms.SystemInformation.VirtualScreen;
-            Rectangle paddedVs = Rectangle.Inflate(vs, 200, 200);
-
-            int liveEx = (int)NativeMethods.SendMessage(ListView, NativeMethods.LVM_GETEXTENDEDLISTVIEWSTYLE, IntPtr.Zero, IntPtr.Zero);
-            bool liveSnap = (liveEx & NativeMethods.LVS_EX_SNAPTOGRID) != 0;
-            bool suspendedHere = false;
-
-            SetListViewRedraw(false);
-            try
+            var lvItem = new NativeMethods.LVITEM64
             {
-                // CRITICAL (ComCtl v6): Suspend LVS_EX_SNAPTOGRID BEFORE moving offscreen!
-                // With SnapToGrid ON, ComCtl v6 clamps negative offscreen coords directly onto
-                // the visible top-left desktop cells AND pushes existing top-left icons aside!
-                double t0 = sw.Elapsed.TotalMilliseconds;
-                if (snapEnabled || liveSnap)
-                {
-                    if (!_restoreSnapOnRelease)
-                    {
-                        SuspendSnapToGrid();
-                        suspendedHere = _restoreSnapOnRelease;
-                    }
-                }
-                timing.SuspendSnapMs = sw.Elapsed.TotalMilliseconds - t0;
+                stateMask = NativeMethods.LVIS_CUT,
+                state = cut ? NativeMethods.LVIS_CUT : 0
+            };
+            Marshal.StructureToPtr(lvItem, _localMem, false);
+            UIntPtr written;
+            if (!NativeMethods.WriteProcessMemory(_hProc, _remoteMem, _localMem, (UIntPtr)lvItemSize, out written))
+                return changed;
 
-                int negX = Math.Min(-5000, vs.Left - lvOrigin.X - 5000);
-                int negY = Math.Min(-5000, vs.Top - lvOrigin.Y - 5000);
-                if (TryParkAtBase(members, negX, negY, -120, lvOrigin, paddedVs, sw, ref timing))
-                    return true;
-
-                int posX = Math.Max(20000, vs.Right - lvOrigin.X + 5000);
-                int posY = Math.Max(20000, vs.Bottom - lvOrigin.Y + 5000);
-                if (TryParkAtBase(members, posX, posY, 120, lvOrigin, paddedVs, sw, ref timing))
-                    return true;
-
-                // Explorer refused offscreen coords: restore original positions BEFORE re-enabling
-                // redraw so zero icons ever flash outside the fence on the desktop!
-                var restore = new List<KeyValuePair<int, Point>>(members.Count);
+            if (cut)
+            {
+                if (members == null || members.Count == 0) return changed;
                 foreach (var m in members)
-                    restore.Add(new KeyValuePair<int, Point>(m.Index, m.ClientPosition));
-                MoveIconsDirectByIndex(restore);
-                if (suspendedHere) RestoreSnapToGrid();
-                return false;
+                {
+                    if (m.Index < 0 || m.Index >= count) continue;
+                    int cur = (int)NativeMethods.SendMessage(ListView, NativeMethods.LVM_GETITEMSTATE,
+                        new IntPtr(m.Index), new IntPtr(NativeMethods.LVIS_CUT));
+                    if ((cur & NativeMethods.LVIS_CUT) != 0) continue;
+                    NativeMethods.SendMessage(ListView, NativeMethods.LVM_SETITEMSTATE, new IntPtr(m.Index), _remoteMem);
+                    changed.Add(m.Index);
+                }
             }
-            finally
+            else if (indicesToClear != null && indicesToClear.Count > 0)
             {
-                SetListViewRedraw(true);
+                foreach (int idx in indicesToClear)
+                {
+                    if (idx < 0 || idx >= count) continue;
+                    NativeMethods.SendMessage(ListView, NativeMethods.LVM_SETITEMSTATE, new IntPtr(idx), _remoteMem);
+                    changed.Add(idx);
+                }
             }
+            return changed;
         }
 
-        private bool TryParkAtBase(List<DesktopIconInfo> members, int baseX, int baseY, int stepX, Point lvOrigin, Rectangle paddedVirtualScreen,
-            System.Diagnostics.Stopwatch sw, ref ParkTiming timing)
+        internal struct DimTiming
         {
-            double tMove = sw.Elapsed.TotalMilliseconds;
-            var moves = new List<KeyValuePair<int, Point>>(members.Count);
-            for (int i = 0; i < members.Count; i++)
-                moves.Add(new KeyValuePair<int, Point>(members[i].Index, new Point(baseX + i * stepX, baseY)));
-            MoveIconsDirectByIndex(moves);
-            timing.MoveMs += sw.Elapsed.TotalMilliseconds - tMove;
-
-            double tVer = sw.Elapsed.TotalMilliseconds;
-            foreach (var m in members)
-            {
-                Point pos;
-                if (!TryGetItemClientPosition(m.Index, out pos) && !TryGetLiveIconPosition(m.Identity, out pos))
-                {
-                    timing.VerifyMs += sw.Elapsed.TotalMilliseconds - tVer;
-                    return false;
-                }
-                if (paddedVirtualScreen.Contains(pos.X + lvOrigin.X, pos.Y + lvOrigin.Y))
-                {
-                    timing.VerifyMs += sw.Elapsed.TotalMilliseconds - tVer;
-                    return false;
-                }
-            }
-            timing.VerifyMs += sw.Elapsed.TotalMilliseconds - tVer;
-            return true;
+            public double DimMs;
+            public int DimmedCount;
         }
 
         public void InvalidateDesktopRect(Rectangle dirtyScreenRect)

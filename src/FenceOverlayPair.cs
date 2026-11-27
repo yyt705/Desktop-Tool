@@ -550,6 +550,8 @@ namespace DeskFences
         private long _hoverWarmCooldownUntilMs = -10000;
         private string _lastPreWarmInfo = "none";
         private string _lastPreWarmRejectReason = "none";
+        private bool _asyncCaptureInFlight;
+        private int _dragSessionSeq;
         private readonly Stopwatch _dragPerfWatch = new Stopwatch();
         private double _perfDownMs;
         private bool _perfHadPreWarmAtDown;
@@ -558,11 +560,11 @@ namespace DeskFences
         private double _perfBeginDragMs;
         private double _perfCaptureMs;
         private bool _perfAdoptedPreWarm;
+        private bool _perfUsedAsyncMidDragCap;
         private NativeMethods.CaptureDiag _perfCapDiag;
         private double _perfRedrawMs;
-        private double _perfDwmFlushMs;
-        private double _perfParkTotalMs;
-        private DesktopIconController.ParkTiming _perfParkTiming;
+        private double _perfDimTotalMs;
+        private DesktopIconController.DimTiming _perfDimTiming;
         private double _perfStartEndMs;
         private bool _perfLoggedFirstStep;
         private double _perfFirstStepSinceDownMs;
@@ -571,6 +573,7 @@ namespace DeskFences
         private int _perfFirstStepDy;
         private double _perfFirstStepAnimMs;
         private Point _dragStartMouse;
+        private Rectangle _dragStartBounds;
         private Point? _lastDragCandidate;
         private bool _dragDpiChanged;
         private int _dragStartOuterCol;
@@ -580,7 +583,7 @@ namespace DeskFences
         private DesktopGridMetrics _dragMetrics;
         private Rectangle[] _dragWorkAreas;
         private List<DesktopIconInfo> _capturedMembers;
-        private bool _membersParked;
+        private List<int> _dimmedMemberIndices;
 
         private enum ResizeEdge { None, Left, Right, Top, Bottom, TopLeft, TopRight, BottomLeft, BottomRight }
         private ResizeEdge _pendingResizeEdge = ResizeEdge.None;
@@ -1064,7 +1067,7 @@ namespace DeskFences
                 GetMenuButtonRect().Contains(local) || HitTestResizeEdge(local) != ResizeEdge.None)
                 return;
             if (_hoverWarmTimer.Enabled) _hoverWarmTimer.Stop();
-            _hoverWarmTimer.Interval = 220;
+            _hoverWarmTimer.Interval = 380;
             _hoverWarmTimer.Start();
         }
 
@@ -1083,40 +1086,135 @@ namespace DeskFences
 
         internal bool TryPreWarmDragCapture()
         {
+            return StartPreWarmCapture(false, null, Rectangle.Empty, 0);
+        }
+
+        private bool StartPreWarmCapture(bool forActiveDrag, List<DesktopIconInfo> explicitMembers, Rectangle explicitFenceBounds, int explicitDragSeq)
+        {
             if (IsDisposed || !IsHandleCreated || !Visible || _manager.Config.Locked ||
-                !_manager.DesktopReady || _manager.IsBusy || Config.MemberIconIds.Count == 0)
+                !_manager.DesktopReady || Config.MemberIconIds.Count == 0)
                 return false;
+            if (!forActiveDrag && _manager.IsBusy) return false;
+            if (_asyncCaptureInFlight) return false;
 
             var sw = Stopwatch.StartNew();
             List<DesktopIconInfo> members;
             int hostGen, itemCount;
             bool usedFastPath;
-            if (!_manager.TryGetLiveMembersForPreWarm(this, out members, out hostGen, out itemCount, out usedFastPath) ||
-                members == null || members.Count == 0)
+            if (forActiveDrag && explicitMembers != null && explicitMembers.Count > 0)
             {
-                ClearDragPreWarm();
-                _hoverWarmCooldownUntilMs = _manager.SessionElapsedMs + 1500;
-                _lastPreWarmInfo = string.Format("noMembers({0:F1}ms)", sw.Elapsed.TotalMilliseconds);
-                return false;
+                members = new List<DesktopIconInfo>(explicitMembers);
+                hostGen = _manager.CurrentHostGeneration;
+                itemCount = _manager.GetDesktopItemCount();
+                usedFastPath = true;
+            }
+            else
+            {
+                if (!_manager.TryGetLiveMembersForPreWarm(this, out members, out hostGen, out itemCount, out usedFastPath) ||
+                    members == null || members.Count == 0)
+                {
+                    ClearDragPreWarm();
+                    _hoverWarmCooldownUntilMs = _manager.SessionElapsedMs + 800;
+                    _lastPreWarmInfo = string.Format("skipFast({0:F1}ms)", sw.Elapsed.TotalMilliseconds);
+                    return false;
+                }
             }
 
             double getMs = sw.Elapsed.TotalMilliseconds;
+            Rectangle reqFenceBounds = (forActiveDrag && !explicitFenceBounds.IsEmpty) ? explicitFenceBounds : Bounds;
             int hh = HeaderHeight;
-            Rectangle bodyScreenRect = new Rectangle(Location.X, Location.Y + hh, Width, Math.Max(2, Height - hh));
+            Rectangle bodyScreenRect = new Rectangle(reqFenceBounds.X, reqFenceBounds.Y + hh, reqFenceBounds.Width, Math.Max(2, reqFenceBounds.Height - hh));
             IntPtr lv = _manager.GetDesktopListViewHandle();
             if (lv == IntPtr.Zero) return false;
 
-            NativeMethods.CaptureDiag diag;
-            Bitmap bmp = NativeMethods.CaptureNativeListViewIconsTransparent(lv, bodyScreenRect, members, out diag);
-            double capMs = sw.Elapsed.TotalMilliseconds - getMs;
+            bool anySelected = false;
+            for (int i = 0; i < members.Count; i++)
+            {
+                if (members[i].Selected) { anySelected = true; break; }
+            }
+            bool desktopWasFg = _manager.IsDesktopListViewForeground();
+
+            // For out-of-process real Explorer: run PrintWindow(0) on a background ThreadPool thread so
+            // DeskFences' UI thread NEVER stalls for 150-220ms during hover, mouse-down, or drag start!
+            // For in-process PrivateDesktopView unit tests: run inline synchronously (~5ms) to avoid same-thread SendMessage deadlock.
+            if (_manager.IsOutOfProcessDesktopHost())
+            {
+                _asyncCaptureInFlight = true;
+                int capturedDragSeq = forActiveDrag ? explicitDragSeq : _dragSessionSeq;
+                var membersCopy = new List<DesktopIconInfo>(members);
+                System.Threading.ThreadPool.QueueUserWorkItem(delegate
+                {
+                    var capSw = Stopwatch.StartNew();
+                    NativeMethods.CaptureDiag diag;
+                    Bitmap bmp = null;
+                    try
+                    {
+                        bmp = NativeMethods.CaptureNativeListViewIconsTransparent(lv, bodyScreenRect, membersCopy, out diag);
+                    }
+                    catch
+                    {
+                        diag = new NativeMethods.CaptureDiag();
+                        if (bmp != null) { bmp.Dispose(); bmp = null; }
+                    }
+                    double capMs = capSw.Elapsed.TotalMilliseconds;
+                    try
+                    {
+                        if (!IsDisposed && IsHandleCreated)
+                        {
+                            BeginInvoke((Action)(() => CompleteAsyncPreWarmCapture(
+                                bmp, diag, reqFenceBounds, hh, hostGen, itemCount, anySelected, desktopWasFg,
+                                membersCopy, usedFastPath, getMs, capMs, forActiveDrag, capturedDragSeq)));
+                        }
+                        else if (bmp != null)
+                        {
+                            bmp.Dispose();
+                        }
+                    }
+                    catch
+                    {
+                        _asyncCaptureInFlight = false;
+                        if (bmp != null) bmp.Dispose();
+                    }
+                });
+                return true;
+            }
+
+            // In-process synchronous path (PrivateDesktopView regression tests)
+            NativeMethods.CaptureDiag syncDiag;
+            Bitmap syncBmp = NativeMethods.CaptureNativeListViewIconsTransparent(lv, bodyScreenRect, members, out syncDiag);
+            double syncCapMs = sw.Elapsed.TotalMilliseconds - getMs;
+            return StoreOrApplyCapturedBitmap(syncBmp, syncDiag, reqFenceBounds, hh, hostGen, itemCount,
+                anySelected, desktopWasFg, members, usedFastPath, getMs, syncCapMs, forActiveDrag, explicitDragSeq);
+        }
+
+        private void CompleteAsyncPreWarmCapture(
+            Bitmap bmp, NativeMethods.CaptureDiag diag, Rectangle reqFenceBounds, int hh,
+            int hostGen, int itemCount, bool anySelected, bool desktopWasFg,
+            List<DesktopIconInfo> members, bool usedFastPath, double getMs, double capMs,
+            bool forActiveDrag, int reqDragSeq)
+        {
+            _asyncCaptureInFlight = false;
+            StoreOrApplyCapturedBitmap(bmp, diag, reqFenceBounds, hh, hostGen, itemCount,
+                anySelected, desktopWasFg, members, usedFastPath, getMs, capMs, forActiveDrag, reqDragSeq);
+        }
+
+        private bool StoreOrApplyCapturedBitmap(
+            Bitmap bmp, NativeMethods.CaptureDiag diag, Rectangle reqFenceBounds, int hh,
+            int hostGen, int itemCount, bool anySelected, bool desktopWasFg,
+            List<DesktopIconInfo> members, bool usedFastPath, double getMs, double capMs,
+            bool forActiveDrag, int reqDragSeq)
+        {
+            if (IsDisposed || !IsHandleCreated)
+            {
+                if (bmp != null) bmp.Dispose();
+                return false;
+            }
             if (bmp == null)
             {
                 _hoverWarmCooldownUntilMs = _manager.SessionElapsedMs + 2500;
                 _lastPreWarmInfo = string.Format("nullBmp(get={0:F1},cap={1:F1})", getMs, capMs);
                 return false;
             }
-            // Accept ANY clean PrintWindow(0) capture (whether labels have true alpha or luminance-extracted
-            // white text); only avoid caching PW_RENDERFULLCONTENT fallback captures!
             if (diag.UsedFallbackFullContent)
             {
                 bmp.Dispose();
@@ -1125,26 +1223,56 @@ namespace DeskFences
                 return false;
             }
 
-            ClearDragPreWarm();
-            bool anySelected = false;
-            for (int i = 0; i < members.Count; i++)
+            _lastPreWarmInfo = string.Format("ok(fast={0},get={1:F1},cap={2:F1},iA={3},lA={4})",
+                usedFastPath ? 1 : 0, getMs, capMs, diag.UsedTrueIconAlpha ? 1 : 0, diag.UsedTrueLabelAlpha ? 1 : 0);
+
+            // If the user ALREADY started dragging this fence while background PrintWindow was running,
+            // seamlessly attach the freshly captured 32-bit ARGB icons mid-drag (real icons stayed untouched at origin!).
+            bool matchesActiveDragSeq = forActiveDrag ? (_dragSessionSeq == reqDragSeq) : (_dragSessionSeq == reqDragSeq + 1);
+            if (_isDragging && _dragNativeIconsLayer == null &&
+                matchesActiveDragSeq &&
+                _dragStartBounds == reqFenceBounds && HeaderHeight == hh &&
+                _manager.CurrentHostGeneration == hostGen &&
+                _capturedMembers != null && _capturedMembers.Count == members.Count)
             {
-                if (members[i].Selected) { anySelected = true; break; }
+                _dragNativeIconsLayer = bmp;
+                _isDragSurfaceActive = true;
+                _perfUsedAsyncMidDragCap = true;
+                _perfCaptureMs = capMs;
+                _perfCapDiag = diag;
+                RedrawLayeredSurface();
+                if (_dimmedMemberIndices == null && _capturedMembers.Count > 0)
+                {
+                    DesktopIconController.DimTiming dt;
+                    _dimmedMemberIndices = _manager.DimDragMembers(_capturedMembers, out dt);
+                    _perfDimTiming = dt;
+                    _perfDimTotalMs = dt.DimMs;
+                }
+                return true;
             }
+
+            if (_isDragging || _dragReleasePending || _completingInteraction ||
+                Bounds != reqFenceBounds || HeaderHeight != hh ||
+                _manager.CurrentHostGeneration != hostGen ||
+                _manager.GetDesktopItemCount() != itemCount)
+            {
+                bmp.Dispose();
+                return false;
+            }
+
+            ClearDragPreWarm();
             _dragPreWarm = new DragPreWarm
             {
                 Layer = bmp,
-                FenceBounds = Bounds,
+                FenceBounds = reqFenceBounds,
                 HeaderHeight = hh,
                 HostGeneration = hostGen,
                 DesktopItemCount = itemCount,
                 AnySelected = anySelected,
-                DesktopWasForeground = _manager.IsDesktopListViewForeground(),
+                DesktopWasForeground = desktopWasFg,
                 CapturedAtMs = _manager.SessionElapsedMs,
                 Members = members
             };
-            _lastPreWarmInfo = string.Format("ok(fast={0},get={1:F1},cap={2:F1},iA={3},lA={4})",
-                usedFastPath ? 1 : 0, getMs, capMs, diag.UsedTrueIconAlpha ? 1 : 0, diag.UsedTrueLabelAlpha ? 1 : 0);
             return true;
         }
 
@@ -1186,14 +1314,14 @@ namespace DeskFences
         private void EnterRigidDragSurface()
         {
             DisposeDragVisuals();
-            _membersParked = false;
+            _dimmedMemberIndices = null;
             _perfCaptureMs = 0;
             _perfAdoptedPreWarm = false;
+            _perfUsedAsyncMidDragCap = false;
             _perfCapDiag = new NativeMethods.CaptureDiag();
             _perfRedrawMs = 0;
-            _perfDwmFlushMs = 0;
-            _perfParkTotalMs = 0;
-            _perfParkTiming = new DesktopIconController.ParkTiming();
+            _perfDimTotalMs = 0;
+            _perfDimTiming = new DesktopIconController.DimTiming();
             var pre = _dragPreWarm;
             _dragPreWarm = null;
             if (_hoverWarmTimer != null && _hoverWarmTimer.Enabled)
@@ -1209,7 +1337,7 @@ namespace DeskFences
 
             var sw = Stopwatch.StartNew();
             int hh = HeaderHeight;
-            Rectangle bodyScreenRect = new Rectangle(Location.X, Location.Y + hh, Width, Math.Max(2, Height - hh));
+            Rectangle bodyScreenRect = new Rectangle(_dragStartBounds.X, _dragStartBounds.Y + hh, _dragStartBounds.Width, Math.Max(2, _dragStartBounds.Height - hh));
             Bitmap adopted;
             if (TryAdoptPreWarm(pre, bodyScreenRect, out adopted))
             {
@@ -1219,53 +1347,51 @@ namespace DeskFences
             else
             {
                 if (pre != null) pre.Dispose();
-                IntPtr lv = _manager.GetDesktopListViewHandle();
-                if (lv != IntPtr.Zero)
-                    _dragNativeIconsLayer = NativeMethods.CaptureNativeListViewIconsTransparent(lv, bodyScreenRect, _capturedMembers, out _perfCapDiag);
+                if (!_manager.IsOutOfProcessDesktopHost())
+                {
+                    // In-process PrivateDesktopView tests: capture inline synchronously (~5ms)
+                    IntPtr lv = _manager.GetDesktopListViewHandle();
+                    if (lv != IntPtr.Zero)
+                        _dragNativeIconsLayer = NativeMethods.CaptureNativeListViewIconsTransparent(lv, bodyScreenRect, _capturedMembers, out _perfCapDiag);
+                }
+                else if (!_asyncCaptureInFlight && _manager.SessionElapsedMs >= _hoverWarmCooldownUntilMs)
+                {
+                    // Real Explorer cold click: NEVER block UI thread for 200ms! Start dragging on Frame 0
+                    // while background PrintWindow captures the untouched stationary originals and attaches seamlessly.
+                    StartPreWarmCapture(true, _capturedMembers, _dragStartBounds, _dragSessionSeq);
+                }
             }
             _perfCaptureMs = sw.Elapsed.TotalMilliseconds;
 
-            if (_dragNativeIconsLayer == null)
+            if (_dragNativeIconsLayer != null)
             {
-                _isDragSurfaceActive = false;
-                return;
-            }
+                // Present captured 32-bit ARGB icons on FenceChromeForm and softly dim stationary originals
+                // via LVIS_CUT — ZERO offscreen coordinate moves, ZERO SnapToGrid toggles, ZERO top-left icon displacement!
+                double tRedraw = sw.Elapsed.TotalMilliseconds;
+                _isDragSurfaceActive = true;
+                RedrawLayeredSurface();
+                _perfRedrawMs = sw.Elapsed.TotalMilliseconds - tRedraw;
 
-            // 1. Present ONLY the transparent captured icons on FenceChromeForm while keeping the exact
-            //    same FenceBackdropForm continuously visible underneath, then latch 1 DWM frame so
-            //    captured icons are guaranteed visible BEFORE Explorer synchronously clears the real ones!
-            double tRedraw = sw.Elapsed.TotalMilliseconds;
-            _isDragSurfaceActive = true;
-            RedrawLayeredSurface();
-            _perfRedrawMs = sw.Elapsed.TotalMilliseconds - tRedraw;
-
-            double tFlush = sw.Elapsed.TotalMilliseconds;
-            try { NativeMethods.DwmFlush(); } catch { }
-            _perfDwmFlushMs = sw.Elapsed.TotalMilliseconds - tFlush;
-
-            // 2. Park real icons offscreen (with SnapToGrid suspended BEFORE moving, inside WM_SETREDRAW(false))
-            //    and synchronously flush ONLY this fence's rect so old real icons NEVER linger behind when moving!
-            double tPark = sw.Elapsed.TotalMilliseconds;
-            if (_manager.ParkDragMembers(_capturedMembers, _dragMetrics.SnapToGridEnabled, Bounds, out _perfParkTiming))
-            {
-                _membersParked = true;
+                double tDim = sw.Elapsed.TotalMilliseconds;
+                _dimmedMemberIndices = _manager.DimDragMembers(_capturedMembers, out _perfDimTiming);
+                _perfDimTotalMs = sw.Elapsed.TotalMilliseconds - tDim;
             }
             else
             {
-                ExitRigidDragSurface();
+                _isDragSurfaceActive = _asyncCaptureInFlight;
             }
-            _perfParkTotalMs = sw.Elapsed.TotalMilliseconds - tPark;
         }
 
         private void WriteDragPerfLog(int memberCount, bool moved)
         {
+            if (!_manager.IsOutOfProcessDesktopHost()) return;
             try
             {
                 string logPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "DeskFences_drag_perf.log");
                 if (System.IO.File.Exists(logPath) && new System.IO.FileInfo(logPath).Length > 65536)
                     System.IO.File.Delete(logPath);
                 string line = string.Format(
-                    "[{0:HH:mm:ss.fff}] title={1} mem={2} cell={3}x{4} moved={5} | hover={6} | down={7:F1}ms(hadW={8},didW={9}) | down->start={10:F1}ms | begin={11:F1}ms({12}) | cap={13:F1}ms(adopt={14},rej={15},iA={16},lA={17},fb={18}) | redraw={19:F1}ms dwm={20:F1}ms | park={21:F1}ms(snap={22:F1},mv={23:F1},ver={24:F1},paint={25:F1}) | step1={26}(down->{27:F1}ms,startEnd->{28:F1}ms,d={29}x{30},anim={31:F1}ms){32}",
+                    "[{0:HH:mm:ss.fff}] title={1} mem={2} cell={3}x{4} moved={5} | hover={6} | down={7:F1}ms(hadW={8},didW={9}) | down->start={10:F1}ms | begin={11:F1}ms({12}) | cap={13:F1}ms(adopt={14},asyncMid={15},rej={16},iA={17},lA={18},fb={19}) | redraw={20:F1}ms | dim={21:F1}ms(cnt={22}) | step1={23}(down->{24:F1}ms,startEnd->{25:F1}ms,d={26}x{27},anim={28:F1}ms){29}",
                     DateTime.Now,
                     Config.Title,
                     memberCount,
@@ -1281,17 +1407,14 @@ namespace DeskFences
                     _manager.LastBeginDragNote ?? "?",
                     _perfCaptureMs,
                     _perfAdoptedPreWarm ? 1 : 0,
+                    _perfUsedAsyncMidDragCap ? 1 : 0,
                     _lastPreWarmRejectReason,
                     _perfCapDiag.UsedTrueIconAlpha ? 1 : 0,
                     _perfCapDiag.UsedTrueLabelAlpha ? 1 : 0,
                     _perfCapDiag.UsedFallbackFullContent ? 1 : 0,
                     _perfRedrawMs,
-                    _perfDwmFlushMs,
-                    _perfParkTotalMs,
-                    _perfParkTiming.SuspendSnapMs,
-                    _perfParkTiming.MoveMs,
-                    _perfParkTiming.VerifyMs,
-                    _perfParkTiming.FlushPaintMs,
+                    _perfDimTotalMs,
+                    _perfDimTiming.DimmedCount,
                     _perfLoggedFirstStep ? 1 : 0,
                     _perfFirstStepSinceDownMs,
                     _perfFirstStepSinceStartMs,
@@ -1671,14 +1794,13 @@ namespace DeskFences
                 _dragPending = true;
                 _dragStartMouse = Cursor.Position;
                 Capture = true;
-                // If user flicked onto the title bar faster than the 80ms hover pre-warm (and pre-warm
-                // isn't in cooldown after fallback), overlap the read-only PrintWindow capture with the
-                // natural press-to-move hand latency.
+                // Never block OnMouseDown with synchronous GetAllIcons or PrintWindow!
+                // On real Explorer (out-of-process), kick off a non-blocking background capture if not already warm.
                 if (Config.MemberIconIds.Count > 0 && !_perfHadPreWarmAtDown &&
+                    _manager.IsOutOfProcessDesktopHost() && !_asyncCaptureInFlight &&
                     _manager.SessionElapsedMs >= _hoverWarmCooldownUntilMs)
                 {
-                    _perfDidDownPreWarm = true;
-                    TryPreWarmDragCapture();
+                    _perfDidDownPreWarm = StartPreWarmCapture(false, null, Rectangle.Empty, 0);
                 }
                 _perfDownMs = _dragPerfWatch.Elapsed.TotalMilliseconds;
             }
@@ -1734,12 +1856,18 @@ namespace DeskFences
             _dragReleasePending = false;
             _dragRelocated = false;
             _lastDragCandidate = null;
+            _dragStartBounds = Bounds;
             _dragStartOuterCol = Config.OuterCol;
             _dragStartOuterRow = Config.OuterRow;
             _dragStepCol = 0;
             _dragStepRow = 0;
+            _dragSessionSeq++;
+            bool trustedWarm = _dragPreWarm != null &&
+                _dragPreWarm.FenceBounds == Bounds &&
+                _dragPreWarm.HostGeneration == _manager.CurrentHostGeneration &&
+                (_manager.SessionElapsedMs - _dragPreWarm.CapturedAtMs) <= 1500;
             double tBegin = _dragPerfWatch.Elapsed.TotalMilliseconds;
-            _capturedMembers = CaptureMembers(true, out _dragMetrics);
+            _capturedMembers = CaptureMembers(true, trustedWarm, out _dragMetrics);
             _perfBeginDragMs = _dragPerfWatch.Elapsed.TotalMilliseconds - tBegin;
             if (_capturedMembers == null)
             {
@@ -1758,11 +1886,16 @@ namespace DeskFences
 
         private List<DesktopIconInfo> CaptureMembers(bool dragging, out DesktopGridMetrics metrics)
         {
+            return CaptureMembers(dragging, false, out metrics);
+        }
+
+        private List<DesktopIconInfo> CaptureMembers(bool dragging, bool trustedRecentPreWarm, out DesktopGridMetrics metrics)
+        {
             _startingInteraction = true;
             _releasedDuringStart = false;
             try
             {
-                return dragging ? _manager.BeginFenceDrag(this, out metrics) : _manager.BeginFenceResize(this, out metrics);
+                return dragging ? _manager.BeginFenceDrag(this, trustedRecentPreWarm, out metrics) : _manager.BeginFenceResize(this, out metrics);
             }
             finally { _startingInteraction = false; }
         }
@@ -2194,14 +2327,18 @@ namespace DeskFences
             StopAnimTimer();
 
             var captured = _capturedMembers;
-            bool wereParked = _membersParked;
+            var dimmed = _dimmedMemberIndices;
+            Rectangle oldBounds = _dragStartBounds;
             bool relocated = _dragRelocated;
             Rectangle[] workAreas = _dragWorkAreas;
             _capturedMembers = null;
-            _membersParked = false;
+            _dimmedMemberIndices = null;
+            _dragStartBounds = Rectangle.Empty;
             _dragRelocated = false;
             _lastDragCandidate = null;
             _dragWorkAreas = null;
+            _dragSessionSeq++;
+            bool hasDimmed = dimmed != null && dimmed.Count > 0;
             bool moved = Config.OuterCol != _dragStartOuterCol || Config.OuterRow != _dragStartOuterRow;
 
             try
@@ -2230,23 +2367,25 @@ namespace DeskFences
 
                 // After an overlap recovery / spring glide, let DWM latch the final stopped glass
                 // position for 1 vsync BEFORE touching SysListView32 so Explorer's desktop thread
-                // is completely settled when icons return.
-                if (relocated && !Disposing && !IsDisposed && _isDragSurfaceActive)
+                // is completely settled when icons move.
+                if (relocated && !Disposing && !IsDisposed && _isDragSurfaceActive && _dragNativeIconsLayer != null)
                 {
                     try { NativeMethods.DwmFlush(); } catch { }
                 }
 
                 // Zero-flash DWM-synchronized handoff:
                 // Use CanCommitToCurrentDesktop() (NOT DesktopReady!) so exiting or display/wallpaper
-                // changes mid-drag ALWAYS restore parked member icons back from offscreen!
+                // changes mid-drag ALWAYS clear LVIS_CUT dimming cleanly!
                 bool snapRestored = false;
-                if ((wereParked || moved) && _manager.CanCommitToCurrentDesktop())
+                if ((hasDimmed || moved) && _manager.CanCommitToCurrentDesktop())
                 {
                     bool committed = _manager.CommitRigidDragDrop(
                         this, captured, _dragMetrics, workAreas,
                         _dragStartOuterCol, _dragStartOuterRow,
                         Config.OuterCol, Config.OuterRow,
                         applyIconPositions && enforce,
+                        oldBounds,
+                        dimmed,
                         out snapRestored);
                     if (!committed)
                     {
@@ -2262,8 +2401,8 @@ namespace DeskFences
                     }
                 }
 
-                // 2. Wait for DWM to ingest & present Explorer's synchronously painted frame.
-                if (!Disposing && !IsDisposed && _isDragSurfaceActive && (wereParked || moved))
+                // 2. Wait for DWM to ingest & present Explorer's synchronously painted frame when icons moved.
+                if (!Disposing && !IsDisposed && _isDragSurfaceActive && _dragNativeIconsLayer != null && moved)
                 {
                     int minFlushes = (relocated || snapRestored) ? 4 : 2;
                     int minMs = (relocated || snapRestored) ? 64 : 32;
