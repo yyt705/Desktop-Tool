@@ -64,6 +64,7 @@ namespace DeskFences
                 InputTests.Run(); Console.WriteLine("PASS input attribution");
                 MonitorTests.Run(); Console.WriteLine("PASS monitor placement");
                 DisplayProfileTests.Run(dir); Console.WriteLine("PASS multi-screen display profiles, member slots and loose icon adaptation");
+                FenceCreationTests.Run(dir); Console.WriteLine("PASS icon-free new fence placement and minimal drag-wrap creation");
                 LifecycleTests.Run(); Console.WriteLine("PASS drag and Explorer lifecycle");
                 NativeMoveTests.Run(dir); Console.WriteLine("PASS native member positioning");
                 DragFrameTests.Run(dir); Console.WriteLine("PASS native two-fence drag, selection, clipping and outsider collisions");

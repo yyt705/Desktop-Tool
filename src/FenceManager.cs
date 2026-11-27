@@ -1188,7 +1188,7 @@ namespace DeskFences
                 bool restoredByProfile = false;
                 if (_needsInitialFence)
                 {
-                    CreateDefaultInitialFence(metrics);
+                    CreateDefaultInitialFence(metrics, icons);
                     _needsInitialFence = false;
                     DisplayProfileManager.CaptureCurrentProfile(Config, MonitorGrid.GetAreas(metrics), icons, metrics, true);
                     _lastAppliedProfileKey = Config.ActiveProfileKey;
@@ -1480,8 +1480,8 @@ namespace DeskFences
         private ContextMenuStrip BuildTrayContextMenu(float dpiScale, bool sysLight, Color accent)
         {
             var menu = Win11MenuRenderer.CreateWin11Menu(sysLight, accent, dpiScale);
-            menu.Items.Add(Win11MenuRenderer.CreateMenuItem("框选桌面区域新建分区", "\uE7A8", dpiScale, (s, e) => StartRegionDrawNewFence()));
-            menu.Items.Add(Win11MenuRenderer.CreateMenuItem("新建桌面分区", "\uE710", dpiScale, (s, e) => CreateNewFence()));
+            menu.Items.Add(Win11MenuRenderer.CreateMenuItem("框选图标 / 区域新建分区", "\uE7A8", dpiScale, (s, e) => StartRegionDrawNewFence()));
+            menu.Items.Add(Win11MenuRenderer.CreateMenuItem("新建空白分区（避开图标）", "\uE710", dpiScale, (s, e) => CreateNewFence()));
             menu.Items.Add(new ToolStripSeparator());
 
             _miProfileInfo = Win11MenuRenderer.CreateMenuItem("屏幕方案：检测中...", "\uE7F4", dpiScale);
@@ -1624,24 +1624,32 @@ namespace DeskFences
             if (_miStartup != null) _miStartup.Checked = IsStartupEnabled();
         }
 
-        private void CreateDefaultInitialFence(DesktopGridMetrics m)
+        private void CreateDefaultInitialFence(DesktopGridMetrics m, List<DesktopIconInfo> icons = null)
         {
             Rectangle primary = MonitorGrid.FromWorkArea(Screen.PrimaryScreen.WorkingArea, m);
+            var areas = MonitorGrid.GetAreas(m);
             var desired = new Point(primary.Left + 2, primary.Top);
-            Rectangle area = primary.Width >= 3 && primary.Height >= 3 ? primary :
-                MonitorGrid.BestArea(MonitorGrid.GetAreas(m), desired, new Size(5, 4), m);
-            if (area.IsEmpty) return;
-            int outerCols = Math.Min(5, area.Width);
-            int outerRows = Math.Min(4, area.Height);
-            Point origin = MonitorGrid.ClampOrigin(area, desired, new Size(outerCols, outerRows));
+            float dpi = MonitorGrid.GetDpiScaleForCell(desired.X, desired.Y, m);
+            var iconCells = BuildOccupiedIconCells(icons, m);
+            Rectangle fitted = FindIconFreeFencePlacement(Config.Fences, iconCells, areas, primary, desired, new Size(5, 4), m, dpi);
+            if (fitted.IsEmpty)
+            {
+                Rectangle area = primary.Width >= 3 && primary.Height >= 3 ? primary :
+                    MonitorGrid.BestArea(areas, desired, new Size(5, 4), m);
+                if (area.IsEmpty) return;
+                int outerCols = Math.Min(5, area.Width);
+                int outerRows = Math.Min(4, area.Height);
+                Point origin = MonitorGrid.ClampOrigin(area, desired, new Size(outerCols, outerRows));
+                fitted = new Rectangle(origin.X, origin.Y, outerCols, outerRows);
+            }
 
             var fc = new FenceConfig
             {
                 Title = "常用工具",
-                OuterCol = origin.X,
-                OuterRow = origin.Y,
-                OuterCols = outerCols,
-                OuterRows = outerRows,
+                OuterCol = fitted.X,
+                OuterRow = fitted.Y,
+                OuterCols = fitted.Width,
+                OuterRows = fitted.Height,
                 ThemeId = "liquid_clear",
                 BackdropOpacity = 1.0,
                 HeaderOpacity = 1.0
@@ -3282,34 +3290,292 @@ namespace DeskFences
             return best;
         }
 
+        internal sealed class IconWrapPlan
+        {
+            public bool HasSelection;
+            public Rectangle OuterRect;
+            public int ShiftCol;
+            public int ShiftRow;
+            public bool OverlapsExistingFence;
+            public bool FitsInMonitor;
+            public List<DesktopIconInfo> WrappedIcons = new List<DesktopIconInfo>();
+            public List<DesktopIconInfo> BorderConflictIcons = new List<DesktopIconInfo>();
+        }
+
+        internal static HashSet<long> BuildOccupiedIconCells(IEnumerable<DesktopIconInfo> icons, DesktopGridMetrics m)
+        {
+            var occupied = new HashSet<long>();
+            if (icons == null || m.CellWidth <= 0 || m.CellHeight <= 0) return occupied;
+            foreach (var ic in icons)
+            {
+                int col = ic.GridCol(m);
+                int row = ic.GridRow(m);
+                occupied.Add((((long)col) << 32) | (uint)row);
+            }
+            return occupied;
+        }
+
+        internal static bool IsRectIconAndFenceFree(
+            int col, int row, int cols, int rows,
+            Rectangle area,
+            List<FenceConfig> existingFences,
+            HashSet<long> occupiedIconCells,
+            DesktopGridMetrics metrics,
+            float dpi)
+        {
+            if (cols < 3 || rows < 3) return false;
+            if (!area.Contains(new Rectangle(col, row, cols, rows))) return false;
+            if (occupiedIconCells != null && occupiedIconCells.Count > 0)
+            {
+                for (int r = row; r < row + rows; r++)
+                {
+                    for (int c = col; c < col + cols; c++)
+                    {
+                        if (occupiedIconCells.Contains((((long)c) << 32) | (uint)r))
+                            return false;
+                    }
+                }
+            }
+            if (existingFences != null)
+            {
+                foreach (var other in existingFences)
+                {
+                    if (ZonesOverlap(col, row, cols, rows,
+                        other.OuterCol, other.OuterRow, other.OuterCols, other.OuterRows, metrics, dpi))
+                        return false;
+                }
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Finds a fence placement whose ENTIRE OuterRect (including its 4-edge reserved border ring)
+        /// contains ZERO desktop icons and overlaps ZERO existing fences.
+        /// Tries preferredSize first, then automatically shrinks (maximizing inner slot capacity down to 3x3)
+        /// so neither position nor size disturbs any existing desktop icon.
+        /// </summary>
+        internal static Rectangle FindIconFreeFencePlacement(
+            IEnumerable<FenceConfig> existingFences,
+            HashSet<long> occupiedIconCells,
+            Rectangle[] areas,
+            Rectangle preferredArea,
+            Point desiredOrigin,
+            Size preferredSize,
+            DesktopGridMetrics metrics,
+            float dpi)
+        {
+            if (areas == null || areas.Length == 0) return Rectangle.Empty;
+            var others = existingFences != null ? existingFences.ToList() : new List<FenceConfig>();
+            int maxW = Math.Max(3, preferredSize.Width);
+            int maxH = Math.Max(3, preferredSize.Height);
+
+            // Order candidate sizes from largest usable inner capacity down to minimum 3x3
+            var candidateSizes = new List<Size>();
+            for (int w = maxW; w >= 3; w--)
+            {
+                for (int h = maxH; h >= 3; h--)
+                    candidateSizes.Add(new Size(w, h));
+            }
+            double prefAspect = (double)maxW / maxH;
+            candidateSizes = candidateSizes
+                .OrderByDescending(s => (s.Width - 2) * (s.Height - 2))
+                .ThenBy(s => Math.Abs((double)s.Width / s.Height - prefAspect))
+                .ThenByDescending(s => s.Width)
+                .ToList();
+
+            // Search preferred monitor first, then other connected monitors
+            var orderedAreas = new List<Rectangle>();
+            if (preferredArea.Width >= 3 && preferredArea.Height >= 3)
+                orderedAreas.Add(preferredArea);
+            foreach (var a in areas)
+            {
+                if (a.Width >= 3 && a.Height >= 3 && !orderedAreas.Contains(a))
+                    orderedAreas.Add(a);
+            }
+
+            double cw = metrics.CellWidth > 0 ? metrics.CellWidth : 100.0;
+            double ch = metrics.CellHeight > 0 ? metrics.CellHeight : 100.0;
+
+            foreach (var area in orderedAreas)
+            {
+                foreach (var sz in candidateSizes)
+                {
+                    if (sz.Width > area.Width || sz.Height > area.Height) continue;
+                    bool found = false;
+                    Point bestOrigin = Point.Empty;
+                    double bestDistSq = double.MaxValue;
+
+                    for (int r = area.Top; r <= area.Bottom - sz.Height; r++)
+                    {
+                        double dy = (r - (double)desiredOrigin.Y) * ch;
+                        double dySq = dy * dy;
+                        if (dySq > bestDistSq + 1.0) continue;
+
+                        for (int c = area.Left; c <= area.Right - sz.Width; c++)
+                        {
+                            double dx = (c - (double)desiredOrigin.X) * cw;
+                            double distSq = dx * dx + dySq;
+                            if (distSq >= bestDistSq - 0.5) continue;
+
+                            if (IsRectIconAndFenceFree(c, r, sz.Width, sz.Height, area, others, occupiedIconCells, metrics, dpi))
+                            {
+                                found = true;
+                                bestOrigin = new Point(c, r);
+                                bestDistSq = distSq;
+                            }
+                        }
+                    }
+
+                    if (found)
+                        return new Rectangle(bestOrigin, sz);
+                }
+            }
+
+            return Rectangle.Empty;
+        }
+
+        /// <summary>
+        /// Computes the smallest valid fence that wraps all loose (non-fence) desktop icons touched by
+        /// <paramref name="selectionScreenRect"/> without moving them (unless they sit flush against
+        /// a monitor edge where a 1-cell shift is required to keep the title bar on-screen).
+        /// </summary>
+        internal static IconWrapPlan ComputeMinimalWrappingFence(
+            Rectangle selectionScreenRect,
+            Rectangle monitorArea,
+            List<DesktopIconInfo> looseIcons,
+            IEnumerable<FenceConfig> existingFences,
+            DesktopGridMetrics metrics,
+            float dpi)
+        {
+            var plan = new IconWrapPlan();
+            if (looseIcons == null || looseIcons.Count == 0 ||
+                metrics.CellWidth <= 0 || metrics.CellHeight <= 0 ||
+                monitorArea.Width < 3 || monitorArea.Height < 3)
+                return plan;
+
+            // 1. Collect all loose icons on monitorArea whose visual bounds intersect the drag selection box
+            var touched = new List<DesktopIconInfo>();
+            foreach (var ic in looseIcons)
+            {
+                int c = ic.GridCol(metrics);
+                int r = ic.GridRow(metrics);
+                if (!monitorArea.Contains(c, r)) continue;
+                Rectangle hitRect = Rectangle.Union(ic.ScreenBounds, Rectangle.Union(ic.IconBounds, ic.LabelBounds));
+                if (hitRect.IntersectsWith(selectionScreenRect))
+                    touched.Add(ic);
+            }
+            if (touched.Count == 0) return plan;
+
+            int minCol = touched.Min(ic => ic.GridCol(metrics));
+            int maxCol = touched.Max(ic => ic.GridCol(metrics));
+            int minRow = touched.Min(ic => ic.GridRow(metrics));
+            int maxRow = touched.Max(ic => ic.GridRow(metrics));
+
+            int innerCols = maxCol - minCol + 1;
+            int innerRows = maxRow - minRow + 1;
+            int rawOuterCol = minCol - 1;
+            int rawOuterRow = minRow - 1;
+            int outerCols = innerCols + 2;
+            int outerRows = innerRows + 2;
+
+            plan.HasSelection = true;
+            plan.FitsInMonitor = outerCols <= monitorArea.Width && outerRows <= monitorArea.Height;
+
+            int clampedCol = plan.FitsInMonitor
+                ? Math.Max(monitorArea.Left, Math.Min(monitorArea.Right - outerCols, rawOuterCol))
+                : rawOuterCol;
+            int clampedRow = plan.FitsInMonitor
+                ? Math.Max(monitorArea.Top, Math.Min(monitorArea.Bottom - outerRows, rawOuterRow))
+                : rawOuterRow;
+
+            plan.OuterRect = new Rectangle(clampedCol, clampedRow, outerCols, outerRows);
+            plan.ShiftCol = clampedCol - rawOuterCol;
+            plan.ShiftRow = clampedRow - rawOuterRow;
+
+            // 2. Include every loose icon whose grid cell sits inside [minCol..maxCol] x [minRow..maxRow]
+            //    so WYSIWYG preview & final members match 100%, and identify any unselected border-ring neighbors.
+            var wrappedIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var ic in looseIcons)
+            {
+                int c = ic.GridCol(metrics);
+                int r = ic.GridRow(metrics);
+                if (c >= minCol && c <= maxCol && r >= minRow && r <= maxRow)
+                {
+                    plan.WrappedIcons.Add(ic);
+                    if (!string.IsNullOrEmpty(ic.Identity)) wrappedIds.Add(ic.Identity);
+                }
+            }
+
+            foreach (var ic in looseIcons)
+            {
+                if (!string.IsNullOrEmpty(ic.Identity) && wrappedIds.Contains(ic.Identity)) continue;
+                int c = ic.GridCol(metrics);
+                int r = ic.GridRow(metrics);
+                if (plan.OuterRect.Contains(c, r))
+                    plan.BorderConflictIcons.Add(ic);
+            }
+
+            if (existingFences != null)
+            {
+                foreach (var other in existingFences)
+                {
+                    if (ZonesOverlap(plan.OuterRect.X, plan.OuterRect.Y, plan.OuterRect.Width, plan.OuterRect.Height,
+                        other.OuterCol, other.OuterRow, other.OuterCols, other.OuterRows, metrics, dpi))
+                    {
+                        plan.OverlapsExistingFence = true;
+                        break;
+                    }
+                }
+            }
+
+            return plan;
+        }
+
+        private List<DesktopIconInfo> GetLooseIcons(List<DesktopIconInfo> allIcons)
+        {
+            if (allIcons == null || allIcons.Count == 0) return new List<DesktopIconInfo>();
+            var owned = new HashSet<string>(
+                Config.Fences.SelectMany(f => f.MemberIconIds),
+                StringComparer.OrdinalIgnoreCase);
+            return allIcons.Where(ic => !string.IsNullOrEmpty(ic.Identity) && !owned.Contains(ic.Identity)).ToList();
+        }
+
         public void CreateNewFence(int? explicitCol = null, int? explicitRow = null, int? explicitCols = null, int? explicitRows = null)
         {
             if (!PrepareFenceInteraction()) return;
-            var m = _controller.GetGridMetrics();
+            var icons = _controller.GetAllIcons(false);
+            if (!_controller.SnapshotComplete) return;
+            var m = _controller.GetGridMetrics(icons);
             Rectangle preferred = MonitorGrid.FromWorkArea(Screen.FromPoint(Cursor.Position).WorkingArea, m);
-            CreateNewFence(m, MonitorGrid.GetAreas(m), preferred, explicitCol, explicitRow, explicitCols, explicitRows);
+            CreateNewFence(m, MonitorGrid.GetAreas(m), preferred, icons, explicitCol, explicitRow, explicitCols, explicitRows);
         }
 
-        private void CreateNewFence(DesktopGridMetrics m, Rectangle[] areas, Rectangle preferred,
-            int? explicitCol, int? explicitRow, int? explicitCols, int? explicitRows)
+        internal FenceConfig CreateNewFence(DesktopGridMetrics m, Rectangle[] areas, Rectangle preferred,
+            List<DesktopIconInfo> icons,
+            int? explicitCol, int? explicitRow, int? explicitCols, int? explicitRows,
+            bool showUi = true)
         {
             int idx = Config.Fences.Count;
             var size = new Size(Math.Max(3, explicitCols ?? 5), Math.Max(3, explicitRows ?? 4));
             var desired = new Point(explicitCol ?? (preferred.Left + (idx * 2 + 1) % Math.Max(1, preferred.Width - size.Width + 1)),
                                     explicitRow ?? (preferred.Top + (idx * 2) % Math.Max(1, preferred.Height - size.Height + 1)));
             float dpi = MonitorGrid.GetDpiScaleForCell(desired.X, desired.Y, m);
-            Rectangle area = MonitorGrid.BestArea(areas, desired, size, m);
-            size.Width = Math.Min(area.Width, size.Width);
-            size.Height = Math.Min(area.Height, size.Height);
-            Rectangle fitted = FindFittingFence(Config.Fences, areas, desired, size, m, dpi, 0);
+            var occupiedIconCells = BuildOccupiedIconCells(icons, m);
+
+            Rectangle fitted = FindIconFreeFencePlacement(
+                Config.Fences, occupiedIconCells, areas, preferred, desired, size, m, dpi);
+
             if (fitted.IsEmpty)
             {
-                _trayIcon.ShowBalloonTip(
-                    3500,
-                    "桌面空间不足",
-                    "当前桌面已无不重叠的空闲位置，请先调整或删除现有分区。",
-                    ToolTipIcon.Info);
-                return;
+                if (showUi && _trayIcon != null)
+                {
+                    _trayIcon.ShowBalloonTip(
+                        4500,
+                        "桌面暂无不影响图标的空闲空间",
+                        "当前桌面没有足够大的空白区域可放置新分区（最小 3×3 格）。请先腾出少量空白，或使用「框选图标 / 区域新建分区」直接包裹现有图标。",
+                        ToolTipIcon.Info);
+                }
+                return null;
             }
 
             var fc = new FenceConfig
@@ -3325,26 +3591,145 @@ namespace DeskFences
             };
             Config.Fences.Add(fc);
             ClearPostSwitchGuard();
-            DisplayProfileManager.CaptureCurrentProfile(Config, MonitorGrid.GetAreas(m), null, m, true);
+            DisplayProfileManager.CaptureCurrentProfile(Config, MonitorGrid.GetAreas(m), icons, m, true);
             _lastAppliedProfileKey = Config.ActiveProfileKey;
             UpdateTrayStates();
-            SaveConfig();
+            if (!_exiting) SaveConfig();
 
-            var form = new FenceChromeForm(this, fc);
-            _forms[fc.Id] = form;
-            if (_fencesHiddenByUser)
+            if (showUi)
             {
-                _fencesHiddenByUser = false;
-                SyncDesktopVisibility();
-                UpdateTrayStates();
+                var form = new FenceChromeForm(this, fc);
+                _forms[fc.Id] = form;
+                if (_fencesHiddenByUser)
+                {
+                    _fencesHiddenByUser = false;
+                    SyncDesktopVisibility();
+                    UpdateTrayStates();
+                }
+                form.Show();
+                form.SyncBoundsFromGrid(m);
+                form.SendToDesktopBottom();
+                form.BeginInlineRename();
             }
-            form.Show();
-            form.SyncBoundsFromGrid(m);
-            form.SendToDesktopBottom();
+            return fc;
+        }
 
-            // Smoothly glide any icons under the newly created zone outside (strict ownership: only manual drag-in!)
-            EnforceAllRules(false, true);
-            form.BeginInlineRename();
+        internal FenceConfig CreateFenceWrappingIcons(
+            IconWrapPlan plan,
+            List<DesktopIconInfo> allIcons,
+            DesktopGridMetrics m,
+            bool showUi = true)
+        {
+            if (plan == null || !plan.HasSelection || plan.WrappedIcons.Count == 0)
+                return null;
+            if (!plan.FitsInMonitor || plan.OverlapsExistingFence)
+            {
+                if (showUi && _trayIcon != null)
+                {
+                    _trayIcon.ShowBalloonTip(
+                        3800,
+                        "无法在所选图标处创建分区",
+                        plan.OverlapsExistingFence
+                            ? "生成的最小包裹分区会与现有分区重叠，请调整框选范围。"
+                            : "所选图标跨度过大，留出分区外框后超出当前屏幕工作区。",
+                        ToolTipIcon.Warning);
+                }
+                return null;
+            }
+
+            int idx = Config.Fences.Count;
+            var fc = new FenceConfig
+            {
+                Title = "分区 " + (idx + 1),
+                OuterCol = plan.OuterRect.X,
+                OuterRow = plan.OuterRect.Y,
+                OuterCols = plan.OuterRect.Width,
+                OuterRows = plan.OuterRect.Height,
+                ThemeId = "liquid_clear",
+                BackdropOpacity = 1.0,
+                HeaderOpacity = 1.0
+            };
+
+            foreach (var ic in plan.WrappedIcons)
+            {
+                if (string.IsNullOrEmpty(ic.Identity)) continue;
+                if (!fc.MemberIconIds.Any(id => string.Equals(id, ic.Identity, StringComparison.OrdinalIgnoreCase)))
+                    fc.MemberIconIds.Add(ic.Identity);
+                if (!string.IsNullOrEmpty(ic.ParsingName))
+                    fc.MemberParsingNames[ic.Identity] = ic.ParsingName;
+            }
+
+            Config.Fences.Add(fc);
+            ClearPostSwitchGuard();
+
+            // If wrapped icons were flush on a monitor edge (e.g. row 0 / col 0), shift them together in
+            // lockstep by (ShiftCol, ShiftRow) so their exact relative arrangement stays intact;
+            // when ShiftCol == 0 && ShiftRow == 0, ZERO wrapped icons move a single pixel!
+            var shiftedFinalCells = new Dictionary<string, Point>(StringComparer.OrdinalIgnoreCase);
+            if (allIcons != null)
+            {
+                foreach (var ic in allIcons)
+                    if (!string.IsNullOrEmpty(ic.Identity))
+                        shiftedFinalCells[ic.Identity] = new Point(ic.GridCol(m), ic.GridRow(m));
+            }
+            if ((plan.ShiftCol != 0 || plan.ShiftRow != 0) && !m.AutoArrangeEnabled)
+            {
+                var shiftTracks = new List<IconSlideTrack>(plan.WrappedIcons.Count);
+                int dx = plan.ShiftCol * m.CellWidth;
+                int dy = plan.ShiftRow * m.CellHeight;
+                foreach (var ic in plan.WrappedIcons)
+                {
+                    int dstCol = ic.GridCol(m) + plan.ShiftCol;
+                    int dstRow = ic.GridRow(m) + plan.ShiftRow;
+                    shiftedFinalCells[ic.Identity] = new Point(dstCol, dstRow);
+                    _knownIconCells[ic.Identity] = new Point(dstCol, dstRow);
+                    shiftTracks.Add(new IconSlideTrack
+                    {
+                        IconInfo = ic,
+                        StartPos = ic.ClientPosition,
+                        TargetPos = new Point(ic.ClientPosition.X + dx, ic.ClientPosition.Y + dy),
+                        LastSentPos = ic.ClientPosition
+                    });
+                }
+                if (shiftTracks.Count > 0)
+                {
+                    if (showUi)
+                        StartIconSlideAnimation(shiftTracks, m.SnapToGridEnabled);
+                    else
+                    {
+                        var immediate = shiftTracks.Select(tr => new KeyValuePair<string, Point>(tr.IconInfo.Identity, tr.TargetPos)).ToList();
+                        _controller.MoveIconsBatch(immediate);
+                    }
+                }
+            }
+
+            SyncActiveProfileFromFinalCells(allIcons, shiftedFinalCells, m, true);
+            if (!_exiting) SaveConfig();
+
+            if (showUi)
+            {
+                var form = new FenceChromeForm(this, fc);
+                _forms[fc.Id] = form;
+                if (_fencesHiddenByUser)
+                {
+                    _fencesHiddenByUser = false;
+                    SyncDesktopVisibility();
+                    UpdateTrayStates();
+                }
+                form.Show();
+                form.SyncBoundsFromGrid(m);
+                form.SendToDesktopBottom();
+
+                // Only run enforcement if unselected icons sit on the 1-cell border ring (smoothly nudged aside);
+                // when zero conflicts exist, NOT A SINGLE ICON on the desktop is touched!
+                if (plan.BorderConflictIcons.Count > 0 || plan.ShiftCol != 0 || plan.ShiftRow != 0)
+                    _desktopDirty = true;
+                if (plan.BorderConflictIcons.Count > 0 && plan.ShiftCol == 0 && plan.ShiftRow == 0)
+                    EnforceAllRules(false, true);
+
+                form.BeginInlineRename();
+            }
+            return fc;
         }
 
         public void SortFenceIcons(string fenceId, FenceSortMode mode)
@@ -3439,12 +3824,16 @@ namespace DeskFences
         public void StartRegionDrawNewFence()
         {
             if (_isDrawingRegion || !PrepareFenceInteraction()) return;
-            var previewMetrics = _controller.GetGridMetrics();
+            var previewIcons = _controller.GetAllIcons(false);
+            if (!_controller.SnapshotComplete) return;
+            var previewMetrics = _controller.GetGridMetrics(previewIcons);
+            var previewLoose = GetLooseIcons(previewIcons);
+            var previewOccupied = BuildOccupiedIconCells(previewIcons, previewMetrics);
             Rectangle selection;
             _isDrawingRegion = true;
             try
             {
-                using (var picker = new RegionDrawOverlayForm(previewMetrics, Config.Fences))
+                using (var picker = new RegionDrawOverlayForm(previewMetrics, Config.Fences, previewLoose, previewOccupied))
                 {
                     if (picker.ShowDialog() != DialogResult.OK) return;
                     selection = picker.SelectedRect;
@@ -3452,16 +3841,33 @@ namespace DeskFences
             }
             finally { _isDrawingRegion = false; }
             if (!PrepareFenceInteraction()) return;
-            var m = _controller.GetGridMetrics();
+
+            var icons = _controller.GetAllIcons(false);
+            if (!_controller.SnapshotComplete) return;
+            var m = _controller.GetGridMetrics(icons);
+            var looseIcons = GetLooseIcons(icons);
             Rectangle work = Screen.FromRectangle(selection).WorkingArea;
             Rectangle r = Rectangle.Intersect(selection, work);
-            if (r.Width < 60 || r.Height < 60) return;
+            if (r.Width < 8 && r.Height < 8) return;
+
+            Rectangle area = MonitorGrid.FromWorkArea(work, m);
+            float localDpi = MonitorGrid.GetDpiScaleForCell(area.Left, area.Top, m);
+
+            // Mode 1: Box touched >= 1 loose desktop icon -> create minimal wrapping fence without moving those icons!
+            var wrapPlan = ComputeMinimalWrappingFence(r, area, looseIcons, Config.Fences, m, localDpi);
+            if (wrapPlan.HasSelection)
+            {
+                CreateFenceWrappingIcons(wrapPlan, icons, m, true);
+                return;
+            }
+
+            // Mode 2: Empty desktop box -> create an icon-free fence inside/near the drawn area without disturbing icons!
+            if (r.Width < 40 || r.Height < 40) return;
             int innerCol = (int)Math.Round((r.Left - (double)m.OriginX) / Math.Max(1, m.CellWidth));
             int innerRow = (int)Math.Round((r.Top - (double)m.OriginY) / Math.Max(1, m.CellHeight));
             int innerCols = Math.Max(1, (int)Math.Round((double)r.Width / Math.Max(1, m.CellWidth)));
             int innerRows = Math.Max(1, (int)Math.Round((double)r.Height / Math.Max(1, m.CellHeight)));
-            Rectangle area = MonitorGrid.FromWorkArea(work, m);
-            CreateNewFence(m, new[] { area }, area, innerCol - 1, innerRow - 1, innerCols + 2, innerRows + 2);
+            CreateNewFence(m, new[] { area }, area, icons, innerCol - 1, innerRow - 1, innerCols + 2, innerRows + 2, true);
         }
 
         public void DeleteFence(string fenceId)
@@ -3650,16 +4056,24 @@ namespace DeskFences
     {
         private readonly DesktopGridMetrics _metrics;
         private readonly List<FenceConfig> _existingFences;
+        private readonly List<DesktopIconInfo> _looseIcons;
+        private readonly HashSet<long> _occupiedIconCells;
         private readonly Rectangle _tipMonitorBounds;
         private bool _dragging;
         private Point _startPt;
         private Point _curPt;
         public Rectangle SelectedRect { get; private set; }
 
-        public RegionDrawOverlayForm(DesktopGridMetrics metrics, List<FenceConfig> existingFences)
+        public RegionDrawOverlayForm(
+            DesktopGridMetrics metrics,
+            List<FenceConfig> existingFences,
+            List<DesktopIconInfo> looseIcons = null,
+            HashSet<long> occupiedIconCells = null)
         {
             _metrics = metrics;
             _existingFences = existingFences ?? new List<FenceConfig>();
+            _looseIcons = looseIcons ?? new List<DesktopIconInfo>();
+            _occupiedIconCells = occupiedIconCells ?? new HashSet<long>();
             _tipMonitorBounds = Screen.FromPoint(Cursor.Position).Bounds;
 
             FormBorderStyle = FormBorderStyle.None;
@@ -3668,7 +4082,7 @@ namespace DeskFences
             StartPosition = FormStartPosition.Manual;
             Bounds = SystemInformation.VirtualScreen;
             BackColor = Color.FromArgb(240, 245, 252);
-            Opacity = 0.28;
+            Opacity = 0.34;
             Cursor = Cursors.Cross;
             DoubleBuffered = true;
         }
@@ -3757,7 +4171,7 @@ namespace DeskFences
             using (Font f = new Font("Microsoft YaHei UI", 16f * tipDpi, FontStyle.Bold, GraphicsUnit.Pixel))
             using (Brush b = new SolidBrush(Color.FromArgb(20, 28, 40)))
             {
-                string tip = "按住鼠标左键框选分区内部区域（实时预览吸附网格，Esc 或右键取消）";
+                string tip = "按住左键框选图标直接生成最小包裹分区，或在空白处框选新建空分区（Esc 或右键取消）";
                 SizeF sz = e.Graphics.MeasureString(tip, f);
                 float tipX = (_tipMonitorBounds.Left - Bounds.X) + (_tipMonitorBounds.Width - sz.Width) / 2f;
                 float tipY = (_tipMonitorBounds.Top - Bounds.Y) + 40f * tipDpi;
@@ -3770,49 +4184,148 @@ namespace DeskFences
                 Rectangle screenRect = new Rectangle(localRect.X + Bounds.X, localRect.Y + Bounds.Y, localRect.Width, localRect.Height);
                 Rectangle work = Screen.FromRectangle(screenRect).WorkingArea;
                 Rectangle clipped = Rectangle.Intersect(screenRect, work);
+                Rectangle area = MonitorGrid.FromWorkArea(work, _metrics);
+
+                // Always draw the raw selection marquee subtly so drag extent is clear
+                if (localRect.Width > 2 || localRect.Height > 2)
+                {
+                    using (Pen marquee = new Pen(Color.FromArgb(140, accent), 1.5f) { DashStyle = DashStyle.Dot })
+                        e.Graphics.DrawRectangle(marquee, localRect);
+                }
 
                 bool drewSnapped = false;
-                if (clipped.Width >= 60 && clipped.Height >= 60 && _metrics.CellWidth > 0 && _metrics.CellHeight > 0)
+                if ((clipped.Width >= 8 || clipped.Height >= 8) && _metrics.CellWidth > 0 && _metrics.CellHeight > 0 &&
+                    area.Width >= 3 && area.Height >= 3)
                 {
-                    int innerCol = (int)Math.Round((clipped.Left - (double)_metrics.OriginX) / _metrics.CellWidth);
-                    int innerRow = (int)Math.Round((clipped.Top - (double)_metrics.OriginY) / _metrics.CellHeight);
-                    int innerCols = Math.Max(1, (int)Math.Round((double)clipped.Width / _metrics.CellWidth));
-                    int innerRows = Math.Max(1, (int)Math.Round((double)clipped.Height / _metrics.CellHeight));
-                    int outerCol = innerCol - 1, outerRow = innerRow - 1;
-                    int outerCols = innerCols + 2, outerRows = innerRows + 2;
-                    float localDpi = MonitorGrid.GetDpiScaleForCell(outerCol, outerRow, _metrics);
+                    float localDpi = MonitorGrid.GetDpiScaleForCell(area.Left, area.Top, _metrics);
+                    var wrapPlan = FenceManager.ComputeMinimalWrappingFence(clipped, area, _looseIcons, _existingFences, _metrics, localDpi);
 
-                    bool overlap = false;
-                    foreach (var other in _existingFences)
+                    if (wrapPlan.HasSelection)
                     {
-                        if (FenceManager.ZonesOverlap(outerCol, outerRow, outerCols, outerRows,
-                            other.OuterCol, other.OuterRow, other.OuterCols, other.OuterRows, _metrics, localDpi))
+                        bool blocked = !wrapPlan.FitsInMonitor || wrapPlan.OverlapsExistingFence;
+                        Color frameColor = blocked
+                            ? Color.FromArgb(225, 70, 50)
+                            : ((wrapPlan.BorderConflictIcons.Count > 0 || wrapPlan.ShiftCol != 0 || wrapPlan.ShiftRow != 0)
+                                ? Color.FromArgb(230, 145, 35)
+                                : Color.FromArgb(28, 160, 96));
+
+                        // Highlight every selected loose icon to be wrapped
+                        foreach (var ic in wrapPlan.WrappedIcons)
                         {
-                            overlap = true;
-                            break;
+                            Rectangle ir = new Rectangle(
+                                ic.ScreenBounds.X - Bounds.X - 2,
+                                ic.ScreenBounds.Y - Bounds.Y - 2,
+                                ic.ScreenBounds.Width + 4,
+                                ic.ScreenBounds.Height + 4);
+                            using (Brush ib = new SolidBrush(Color.FromArgb(90, frameColor)))
+                            using (Pen ip = new Pen(frameColor, 2.0f * localDpi))
+                            {
+                                e.Graphics.FillRectangle(ib, ir);
+                                e.Graphics.DrawRectangle(ip, ir);
+                            }
                         }
+
+                        // Highlight any unselected border-ring neighbor icons in amber
+                        foreach (var ic in wrapPlan.BorderConflictIcons)
+                        {
+                            Rectangle ir = new Rectangle(
+                                ic.ScreenBounds.X - Bounds.X - 2,
+                                ic.ScreenBounds.Y - Bounds.Y - 2,
+                                ic.ScreenBounds.Width + 4,
+                                ic.ScreenBounds.Height + 4);
+                            using (Pen ip = new Pen(Color.FromArgb(230, 140, 30), 2.0f * localDpi) { DashStyle = DashStyle.Dash })
+                                e.Graphics.DrawRectangle(ip, ir);
+                        }
+
+                        Rectangle outer = wrapPlan.OuterRect;
+                        int hh;
+                        Rectangle snappedScreen = FenceChromeForm.ComputeGridBounds(
+                            outer.X, outer.Y, outer.Width, outer.Height, _metrics, localDpi, out hh);
+                        Rectangle snappedLocal = new Rectangle(
+                            snappedScreen.X - Bounds.X, snappedScreen.Y - Bounds.Y,
+                            snappedScreen.Width, snappedScreen.Height);
+
+                        using (Brush fill = new SolidBrush(Color.FromArgb(55, frameColor)))
+                        using (Pen pen = new Pen(frameColor, 2.5f * localDpi))
+                        {
+                            e.Graphics.FillRectangle(fill, snappedLocal);
+                            e.Graphics.DrawRectangle(pen, snappedLocal);
+                        }
+
+                        Rectangle innerLocal = new Rectangle(
+                            _metrics.OriginX + (outer.X + 1) * _metrics.CellWidth - Bounds.X,
+                            _metrics.OriginY + (outer.Y + 1) * _metrics.CellHeight - Bounds.Y,
+                            (outer.Width - 2) * _metrics.CellWidth,
+                            (outer.Height - 2) * _metrics.CellHeight);
+                        using (Pen dashPen = new Pen(Color.FromArgb(190, frameColor), 1.5f) { DashStyle = DashStyle.Dash })
+                            e.Graphics.DrawRectangle(dashPen, innerLocal);
+
+                        string badge;
+                        if (wrapPlan.OverlapsExistingFence)
+                            badge = string.Format("选中 {0} 个图标（与现有分区重叠，无法生成）", wrapPlan.WrappedIcons.Count);
+                        else if (!wrapPlan.FitsInMonitor)
+                            badge = string.Format("选中 {0} 个图标（超出屏幕可用范围）", wrapPlan.WrappedIcons.Count);
+                        else if (wrapPlan.ShiftCol != 0 || wrapPlan.ShiftRow != 0)
+                            badge = string.Format("最小分区包裹 {0} 个图标（贴近屏幕边缘，将整体内移留出标题栏）", wrapPlan.WrappedIcons.Count);
+                        else if (wrapPlan.BorderConflictIcons.Count > 0)
+                            badge = string.Format("原地包裹 {0} 个图标（所选不动，外圈 {1} 个相邻图标平滑让位）",
+                                wrapPlan.WrappedIcons.Count, wrapPlan.BorderConflictIcons.Count);
+                        else
+                            badge = string.Format("原地包裹 {0} 个图标（{1}×{2} 最小分区，不移动任何图标）",
+                                wrapPlan.WrappedIcons.Count, outer.Width - 2, outer.Height - 2);
+
+                        DrawPreviewBadge(e.Graphics, badge, snappedLocal, frameColor, localDpi);
+                        drewSnapped = true;
                     }
-
-                    int hh;
-                    Rectangle snappedScreen = FenceChromeForm.ComputeGridBounds(outerCol, outerRow, outerCols, outerRows, _metrics, localDpi, out hh);
-                    Rectangle snappedLocal = new Rectangle(snappedScreen.X - Bounds.X, snappedScreen.Y - Bounds.Y, snappedScreen.Width, snappedScreen.Height);
-                    Color frameColor = overlap ? Color.FromArgb(230, 100, 40) : accent;
-
-                    using (Brush fill = new SolidBrush(Color.FromArgb(65, frameColor)))
-                    using (Pen pen = new Pen(frameColor, 2.5f * localDpi))
+                    else if (clipped.Width >= 40 && clipped.Height >= 40)
                     {
-                        e.Graphics.FillRectangle(fill, snappedLocal);
-                        e.Graphics.DrawRectangle(pen, snappedLocal);
+                        int innerCol = (int)Math.Round((clipped.Left - (double)_metrics.OriginX) / _metrics.CellWidth);
+                        int innerRow = (int)Math.Round((clipped.Top - (double)_metrics.OriginY) / _metrics.CellHeight);
+                        int innerCols = Math.Max(1, (int)Math.Round((double)clipped.Width / _metrics.CellWidth));
+                        int innerRows = Math.Max(1, (int)Math.Round((double)clipped.Height / _metrics.CellHeight));
+                        int outerCol = innerCol - 1, outerRow = innerRow - 1;
+                        int outerCols = innerCols + 2, outerRows = innerRows + 2;
+
+                        Rectangle fitted = FenceManager.FindIconFreeFencePlacement(
+                            _existingFences, _occupiedIconCells, new[] { area }, area,
+                            new Point(outerCol, outerRow), new Size(outerCols, outerRows), _metrics, localDpi);
+
+                        bool exactFit = !fitted.IsEmpty && fitted.X == outerCol && fitted.Y == outerRow &&
+                                        fitted.Width == outerCols && fitted.Height == outerRows;
+                        Rectangle previewOuter = fitted.IsEmpty ? new Rectangle(outerCol, outerRow, outerCols, outerRows) : fitted;
+                        Color frameColor = fitted.IsEmpty
+                            ? Color.FromArgb(225, 70, 50)
+                            : (exactFit ? accent : Color.FromArgb(230, 145, 35));
+
+                        int hh;
+                        Rectangle snappedScreen = FenceChromeForm.ComputeGridBounds(
+                            previewOuter.X, previewOuter.Y, previewOuter.Width, previewOuter.Height, _metrics, localDpi, out hh);
+                        Rectangle snappedLocal = new Rectangle(
+                            snappedScreen.X - Bounds.X, snappedScreen.Y - Bounds.Y,
+                            snappedScreen.Width, snappedScreen.Height);
+
+                        using (Brush fill = new SolidBrush(Color.FromArgb(60, frameColor)))
+                        using (Pen pen = new Pen(frameColor, 2.5f * localDpi))
+                        {
+                            e.Graphics.FillRectangle(fill, snappedLocal);
+                            e.Graphics.DrawRectangle(pen, snappedLocal);
+                        }
+                        Rectangle innerLocal = new Rectangle(
+                            _metrics.OriginX + (previewOuter.X + 1) * _metrics.CellWidth - Bounds.X,
+                            _metrics.OriginY + (previewOuter.Y + 1) * _metrics.CellHeight - Bounds.Y,
+                            (previewOuter.Width - 2) * _metrics.CellWidth,
+                            (previewOuter.Height - 2) * _metrics.CellHeight);
+                        using (Pen dashPen = new Pen(Color.FromArgb(180, frameColor), 1.5f) { DashStyle = DashStyle.Dash })
+                            e.Graphics.DrawRectangle(dashPen, innerLocal);
+
+                        string badge = fitted.IsEmpty
+                            ? "该区域无不影响图标的空闲空间"
+                            : (exactFit
+                                ? string.Format("新建空白分区（{0}×{1} 格，不影响任何图标）", previewOuter.Width - 2, previewOuter.Height - 2)
+                                : string.Format("已自动避开图标调整为 {0}×{1} 格", previewOuter.Width - 2, previewOuter.Height - 2));
+                        DrawPreviewBadge(e.Graphics, badge, snappedLocal, frameColor, localDpi);
+                        drewSnapped = true;
                     }
-                    // Draw inner icon grid preview
-                    Rectangle innerLocal = new Rectangle(
-                        _metrics.OriginX + innerCol * _metrics.CellWidth - Bounds.X,
-                        _metrics.OriginY + innerRow * _metrics.CellHeight - Bounds.Y,
-                        innerCols * _metrics.CellWidth,
-                        innerRows * _metrics.CellHeight);
-                    using (Pen dashPen = new Pen(Color.FromArgb(180, frameColor), 1.5f) { DashStyle = DashStyle.Dash })
-                        e.Graphics.DrawRectangle(dashPen, innerLocal);
-                    drewSnapped = true;
                 }
 
                 if (!drewSnapped)
@@ -3823,6 +4336,30 @@ namespace DeskFences
                         e.Graphics.FillRectangle(fill, localRect);
                         e.Graphics.DrawRectangle(pen, localRect);
                     }
+                }
+            }
+        }
+
+        private void DrawPreviewBadge(Graphics g, string text, Rectangle box, Color badgeColor, float dpi)
+        {
+            using (Font bf = new Font("Microsoft YaHei UI", 13f * dpi, FontStyle.Bold, GraphicsUnit.Pixel))
+            {
+                SizeF sz = g.MeasureString(text, bf);
+                int padX = (int)Math.Round(10 * dpi);
+                int padY = (int)Math.Round(5 * dpi);
+                int bw = (int)Math.Ceiling(sz.Width) + padX * 2;
+                int bh = (int)Math.Ceiling(sz.Height) + padY * 2;
+                int bx = Math.Max(8, Math.Min(Width - bw - 8, box.Left + (box.Width - bw) / 2));
+                int by = box.Top - bh - (int)Math.Round(8 * dpi);
+                if (by < 8) by = box.Bottom + (int)Math.Round(8 * dpi);
+                Rectangle br = new Rectangle(bx, by, bw, bh);
+                using (Brush bg = new SolidBrush(Color.FromArgb(255, 22, 28, 40)))
+                using (Pen border = new Pen(badgeColor, Math.Max(1.5f, 2f * dpi)))
+                using (Brush fg = new SolidBrush(Color.White))
+                {
+                    g.FillRectangle(bg, br);
+                    g.DrawRectangle(border, br);
+                    g.DrawString(text, bf, fg, bx + padX, by + padY);
                 }
             }
         }

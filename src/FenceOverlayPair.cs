@@ -2474,8 +2474,8 @@ namespace DeskFences
             menu.Items.Add(bgSub);
 
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(Win11MenuRenderer.CreateMenuItem("新建分区", "\uE710", DpiScale, (s, e) => _manager.CreateNewFence()));
-            menu.Items.Add(Win11MenuRenderer.CreateMenuItem("框选桌面区域新建分区", "\uE7A8", DpiScale, (s, e) => _manager.StartRegionDrawNewFence()));
+            menu.Items.Add(Win11MenuRenderer.CreateMenuItem("新建空白分区（避开图标）", "\uE710", DpiScale, (s, e) => _manager.CreateNewFence()));
+            menu.Items.Add(Win11MenuRenderer.CreateMenuItem("框选图标 / 区域新建分区", "\uE7A8", DpiScale, (s, e) => _manager.StartRegionDrawNewFence()));
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(Win11MenuRenderer.CreateMenuItem("删除此分区（不影响桌面图标）", "\uE74D", DpiScale, (s, e) => _manager.DeleteFence(Config.Id)));
 
