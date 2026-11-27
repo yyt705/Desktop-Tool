@@ -549,6 +549,12 @@ namespace DeskFences
             base.WndProc(ref m);
         }
 
+        public void EnsurePrepared()
+        {
+            if (IsDisposed || IsHandleCreated) return;
+            var ensure = Handle;
+        }
+
         public void ShowMask(Rectangle screenRect, Bitmap premulMask, IntPtr desktopOwner, IntPtr chromeHwnd)
         {
             if (premulMask == null || screenRect.Width <= 0 || screenRect.Height <= 0) return;
@@ -627,6 +633,7 @@ namespace DeskFences
         {
             public Bitmap Layer;
             public Bitmap OldSlotMask;
+            public WallpaperCaptureDiag WpDiag;
             public Rectangle FenceBounds;
             public int HeaderHeight;
             public int HostGeneration;
@@ -667,8 +674,10 @@ namespace DeskFences
         private bool _perfAdoptedPreWarm;
         private bool _perfUsedAsyncMidDragCap;
         private NativeMethods.CaptureDiag _perfCapDiag;
+        private WallpaperCaptureDiag _perfWpDiag;
         private double _perfRedrawMs;
         private double _perfMaskTotalMs;
+        private bool _perfOldSlotMaskShown;
         private double _perfStartEndMs;
         private bool _perfLoggedFirstStep;
         private double _perfFirstStepSinceDownMs;
@@ -1254,6 +1263,7 @@ namespace DeskFences
             if (lv == IntPtr.Zero) return false;
             IntPtr wallpaperWorker = _manager.GetWallpaperWorkerHandle();
             Color? inProcBackColor = _manager.GetInProcessDesktopBackColor();
+            WallpaperCalibrationContext wpCal = _manager.CaptureWallpaperCalibrationContext(reqFenceBounds);
 
             bool anySelected = false;
             for (int i = 0; i < members.Count; i++)
@@ -1274,13 +1284,14 @@ namespace DeskFences
                 {
                     var capSw = Stopwatch.StartNew();
                     NativeMethods.CaptureDiag diag;
+                    WallpaperCaptureDiag wpDiag = new WallpaperCaptureDiag { Source = "none" };
                     Bitmap bmp = null;
                     Bitmap maskBmp = null;
                     try
                     {
                         bmp = NativeMethods.CaptureNativeListViewIconsTransparent(lv, bodyScreenRect, membersCopy, out diag);
                         if (bmp != null && !diag.UsedFallbackFullContent)
-                            maskBmp = DesktopWallpaperCache.BuildMemberWallpaperMask(reqFenceBounds, membersCopy, wallpaperWorker, null);
+                            maskBmp = DesktopWallpaperCache.BuildMemberWallpaperMask(reqFenceBounds, membersCopy, wallpaperWorker, null, wpCal, out wpDiag);
                     }
                     catch
                     {
@@ -1294,7 +1305,7 @@ namespace DeskFences
                         if (!IsDisposed && IsHandleCreated)
                         {
                             BeginInvoke((Action)(() => CompleteAsyncPreWarmCapture(
-                                bmp, maskBmp, diag, reqFenceBounds, hh, hostGen, itemCount, anySelected, desktopWasFg,
+                                bmp, maskBmp, diag, wpDiag, reqFenceBounds, hh, hostGen, itemCount, anySelected, desktopWasFg,
                                 membersCopy, usedFastPath, getMs, capMs, forActiveDrag, capturedDragSeq)));
                         }
                         else
@@ -1315,28 +1326,29 @@ namespace DeskFences
 
             // In-process synchronous path (PrivateDesktopView regression tests)
             NativeMethods.CaptureDiag syncDiag;
+            WallpaperCaptureDiag syncWpDiag = new WallpaperCaptureDiag { Source = "none" };
             Bitmap syncBmp = NativeMethods.CaptureNativeListViewIconsTransparent(lv, bodyScreenRect, members, out syncDiag);
             Bitmap syncMask = (syncBmp != null && !syncDiag.UsedFallbackFullContent)
-                ? DesktopWallpaperCache.BuildMemberWallpaperMask(reqFenceBounds, members, IntPtr.Zero, inProcBackColor)
+                ? DesktopWallpaperCache.BuildMemberWallpaperMask(reqFenceBounds, members, IntPtr.Zero, inProcBackColor, null, out syncWpDiag)
                 : null;
             double syncCapMs = sw.Elapsed.TotalMilliseconds - getMs;
-            return StoreOrApplyCapturedBitmap(syncBmp, syncMask, syncDiag, reqFenceBounds, hh, hostGen, itemCount,
+            return StoreOrApplyCapturedBitmap(syncBmp, syncMask, syncDiag, syncWpDiag, reqFenceBounds, hh, hostGen, itemCount,
                 anySelected, desktopWasFg, members, usedFastPath, getMs, syncCapMs, forActiveDrag, explicitDragSeq);
         }
 
         private void CompleteAsyncPreWarmCapture(
-            Bitmap bmp, Bitmap maskBmp, NativeMethods.CaptureDiag diag, Rectangle reqFenceBounds, int hh,
+            Bitmap bmp, Bitmap maskBmp, NativeMethods.CaptureDiag diag, WallpaperCaptureDiag wpDiag, Rectangle reqFenceBounds, int hh,
             int hostGen, int itemCount, bool anySelected, bool desktopWasFg,
             List<DesktopIconInfo> members, bool usedFastPath, double getMs, double capMs,
             bool forActiveDrag, int reqDragSeq)
         {
             _asyncCaptureInFlight = false;
-            StoreOrApplyCapturedBitmap(bmp, maskBmp, diag, reqFenceBounds, hh, hostGen, itemCount,
+            StoreOrApplyCapturedBitmap(bmp, maskBmp, diag, wpDiag, reqFenceBounds, hh, hostGen, itemCount,
                 anySelected, desktopWasFg, members, usedFastPath, getMs, capMs, forActiveDrag, reqDragSeq);
         }
 
         private bool StoreOrApplyCapturedBitmap(
-            Bitmap bmp, Bitmap maskBmp, NativeMethods.CaptureDiag diag, Rectangle reqFenceBounds, int hh,
+            Bitmap bmp, Bitmap maskBmp, NativeMethods.CaptureDiag diag, WallpaperCaptureDiag wpDiag, Rectangle reqFenceBounds, int hh,
             int hostGen, int itemCount, bool anySelected, bool desktopWasFg,
             List<DesktopIconInfo> members, bool usedFastPath, double getMs, double capMs,
             bool forActiveDrag, int reqDragSeq)
@@ -1363,8 +1375,9 @@ namespace DeskFences
                 return false;
             }
 
-            _lastPreWarmInfo = string.Format("ok(fast={0},get={1:F1},cap={2:F1},iA={3},lA={4},mask={5})",
-                usedFastPath ? 1 : 0, getMs, capMs, diag.UsedTrueIconAlpha ? 1 : 0, diag.UsedTrueLabelAlpha ? 1 : 0, maskBmp != null ? 1 : 0);
+            _lastPreWarmInfo = string.Format("ok(fast={0},get={1:F1},cap={2:F1},iA={3},lA={4},mask={5},wp={6}:{7},{8}/{9:F1}ms)",
+                usedFastPath ? 1 : 0, getMs, capMs, diag.UsedTrueIconAlpha ? 1 : 0, diag.UsedTrueLabelAlpha ? 1 : 0, maskBmp != null ? 1 : 0,
+                wpDiag.Source ?? "?", wpDiag.CalibrationShift.X, wpDiag.CalibrationShift.Y, wpDiag.ElapsedMs);
 
             // If the user ALREADY started dragging this fence while background PrintWindow was running,
             // seamlessly attach the freshly captured 32-bit ARGB icons + old-slot wallpaper mask mid-drag!
@@ -1380,6 +1393,7 @@ namespace DeskFences
                 _perfUsedAsyncMidDragCap = true;
                 _perfCaptureMs = capMs;
                 _perfCapDiag = diag;
+                _perfWpDiag = wpDiag;
                 ActivateCapturedDragVisuals();
                 return true;
             }
@@ -1399,6 +1413,7 @@ namespace DeskFences
             {
                 Layer = bmp,
                 OldSlotMask = maskBmp,
+                WpDiag = wpDiag,
                 FenceBounds = reqFenceBounds,
                 HeaderHeight = hh,
                 HostGeneration = hostGen,
@@ -1408,6 +1423,13 @@ namespace DeskFences
                 CapturedAtMs = _manager.SessionElapsedMs,
                 Members = members
             };
+            // Pre-create hidden mask HWND at rest so first-drag ShowMask never pays cold WinForms handle creation (~40ms)
+            if (maskBmp != null)
+            {
+                if (_oldSlotMask == null || _oldSlotMask.IsDisposed)
+                    _oldSlotMask = new OldSlotMaskForm();
+                _oldSlotMask.EnsurePrepared();
+            }
             return true;
         }
 
@@ -1478,6 +1500,7 @@ namespace DeskFences
                 if (_oldSlotMask == null || _oldSlotMask.IsDisposed)
                     _oldSlotMask = new OldSlotMaskForm();
                 _oldSlotMask.ShowMask(_dragStartBounds, _dragOldSlotMaskLayer, _manager.GetDesktopOwner(), Handle);
+                _perfOldSlotMaskShown = _oldSlotMask.IsMaskVisible;
                 if (Backdrop != null && !Backdrop.IsDisposed)
                     Backdrop.HideBackdrop();
                 _perfMaskTotalMs = sw.Elapsed.TotalMilliseconds - tMask;
@@ -1492,8 +1515,10 @@ namespace DeskFences
             _perfAdoptedPreWarm = false;
             _perfUsedAsyncMidDragCap = false;
             _perfCapDiag = new NativeMethods.CaptureDiag();
+            _perfWpDiag = new WallpaperCaptureDiag { Source = "none" };
             _perfRedrawMs = 0;
             _perfMaskTotalMs = 0;
+            _perfOldSlotMaskShown = false;
             var pre = _dragPreWarm;
             _dragPreWarm = null;
             if (_hoverWarmTimer != null && _hoverWarmTimer.Enabled)
@@ -1512,10 +1537,12 @@ namespace DeskFences
             Rectangle bodyScreenRect = new Rectangle(_dragStartBounds.X, _dragStartBounds.Y + hh, _dragStartBounds.Width, Math.Max(2, _dragStartBounds.Height - hh));
             Bitmap adopted;
             Bitmap adoptedMask;
+            WallpaperCaptureDiag preWpDiag = pre != null ? pre.WpDiag : new WallpaperCaptureDiag { Source = "none" };
             if (TryAdoptPreWarm(pre, bodyScreenRect, out adopted, out adoptedMask))
             {
                 _dragNativeIconsLayer = adopted;
                 _dragOldSlotMaskLayer = adoptedMask;
+                _perfWpDiag = preWpDiag;
                 _perfAdoptedPreWarm = true;
             }
             else
@@ -1529,7 +1556,7 @@ namespace DeskFences
                     {
                         _dragNativeIconsLayer = NativeMethods.CaptureNativeListViewIconsTransparent(lv, bodyScreenRect, _capturedMembers, out _perfCapDiag);
                         if (_dragNativeIconsLayer != null && !_perfCapDiag.UsedFallbackFullContent)
-                            _dragOldSlotMaskLayer = DesktopWallpaperCache.BuildMemberWallpaperMask(_dragStartBounds, _capturedMembers, IntPtr.Zero, _manager.GetInProcessDesktopBackColor());
+                            _dragOldSlotMaskLayer = DesktopWallpaperCache.BuildMemberWallpaperMask(_dragStartBounds, _capturedMembers, IntPtr.Zero, _manager.GetInProcessDesktopBackColor(), null, out _perfWpDiag);
                     }
                 }
                 else if (!_asyncCaptureInFlight && _manager.SessionElapsedMs >= _hoverWarmCooldownUntilMs)
@@ -1546,7 +1573,8 @@ namespace DeskFences
                 if (_dragOldSlotMaskLayer == null && !_dragStartBounds.IsEmpty)
                 {
                     _dragOldSlotMaskLayer = DesktopWallpaperCache.BuildMemberWallpaperMask(
-                        _dragStartBounds, _capturedMembers, _manager.GetWallpaperWorkerHandle(), _manager.GetInProcessDesktopBackColor());
+                        _dragStartBounds, _capturedMembers, _manager.GetWallpaperWorkerHandle(),
+                        _manager.GetInProcessDesktopBackColor(), _manager.CaptureWallpaperCalibrationContext(_dragStartBounds), out _perfWpDiag);
                 }
                 ActivateCapturedDragVisuals();
             }
@@ -1565,7 +1593,7 @@ namespace DeskFences
                 if (System.IO.File.Exists(logPath) && new System.IO.FileInfo(logPath).Length > 65536)
                     System.IO.File.Delete(logPath);
                 string line = string.Format(
-                    "[{0:HH:mm:ss.fff}] title={1} mem={2} cell={3}x{4} moved={5} | hover={6} | down={7:F1}ms(hadW={8},didW={9}) | down->start={10:F1}ms | begin={11:F1}ms({12}) | cap={13:F1}ms(adopt={14},asyncMid={15},rej={16},iA={17},lA={18},fb={19}) | redraw={20:F1}ms | mask={21:F1}ms(on={22}) | step1={23}(down->{24:F1}ms,startEnd->{25:F1}ms,d={26}x{27},anim={28:F1}ms){29}",
+                    "[{0:HH:mm:ss.fff}] title={1} mem={2} cell={3}x{4} moved={5} | hover={6} | down={7:F1}ms(hadW={8},didW={9}) | down->start={10:F1}ms | begin={11:F1}ms({12}) | cap={13:F1}ms(adopt={14},asyncMid={15},rej={16},iA={17},lA={18},fb={19}) | redraw={20:F1}ms | mask={21:F1}ms(shown={22},wp={23},cal={24},{25},p={26},{27:F1}ms) | step1={28}(down->{29:F1}ms,startEnd->{30:F1}ms,d={31}x{32},anim={33:F1}ms){34}",
                     DateTime.Now,
                     Config.Title,
                     memberCount,
@@ -1588,7 +1616,12 @@ namespace DeskFences
                     _perfCapDiag.UsedFallbackFullContent ? 1 : 0,
                     _perfRedrawMs,
                     _perfMaskTotalMs,
-                    _oldSlotMask != null && _oldSlotMask.IsMaskVisible ? 1 : 0,
+                    _perfOldSlotMaskShown ? 1 : 0,
+                    _perfWpDiag.Source ?? "none",
+                    _perfWpDiag.CalibrationShift.X,
+                    _perfWpDiag.CalibrationShift.Y,
+                    _perfWpDiag.PatchCount,
+                    _perfWpDiag.ElapsedMs,
                     _perfLoggedFirstStep ? 1 : 0,
                     _perfFirstStepSinceDownMs,
                     _perfFirstStepSinceStartMs,

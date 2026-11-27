@@ -937,6 +937,181 @@ namespace DeskFences
                 Check(outside.A == 0,
                     "Mask pixels outside member icon rects must remain strictly transparent (Alpha==0) so neighboring icons are untouched.");
             }
+
+            // 3. Fast sub-rectangle wallpaper rendering must be pixel-exact (maxDiff <= 1) vs full-monitor render
+            //    across ALL 5 scaling modes (Center/Tile/Stretch/Fit/Fill) and non-zero calibration shifts!
+            using (var synthWp = new Bitmap(960, 600, PixelFormat.Format32bppPArgb))
+            {
+                var bd = synthWp.LockBits(new Rectangle(0, 0, synthWp.Width, synthWp.Height), ImageLockMode.WriteOnly, PixelFormat.Format32bppPArgb);
+                try
+                {
+                    int stride = Math.Abs(bd.Stride);
+                    byte[] buf = new byte[stride * synthWp.Height];
+                    for (int y = 0; y < synthWp.Height; y++)
+                    {
+                        int row = y * stride;
+                        for (int x = 0; x < synthWp.Width; x++)
+                        {
+                            // Rich landscape texture: sky gradient, sharp horizon at y=290, mountains, water ripples
+                            double wave = Math.Sin(x * 0.045) * 18.0 + Math.Cos(y * 0.065) * 14.0;
+                            int r, g, b;
+                            if (y < 290 + (int)(Math.Sin(x * 0.015) * 28.0))
+                            {
+                                r = Math.Max(0, Math.Min(255, (int)(205 - y * 0.22 + wave)));
+                                g = Math.Max(0, Math.Min(255, (int)(215 - y * 0.16 - wave * 0.5)));
+                                b = Math.Max(0, Math.Min(255, (int)(235 - y * 0.10 + Math.Sin((x + y) * 0.03) * 18)));
+                            }
+                            else
+                            {
+                                r = Math.Max(0, Math.Min(255, (int)(45 + (y - 290) * 0.25 + wave)));
+                                g = Math.Max(0, Math.Min(255, (int)(120 + Math.Sin(y * 0.18) * 35 + Math.Cos(x * 0.04) * 20)));
+                                b = Math.Max(0, Math.Min(255, (int)(145 + (x * 0.06) + Math.Sin(y * 0.24) * 28)));
+                            }
+                            int idx = row + x * 4;
+                            buf[idx] = (byte)b;
+                            buf[idx + 1] = (byte)g;
+                            buf[idx + 2] = (byte)r;
+                            buf[idx + 3] = 255;
+                        }
+                    }
+                    Marshal.Copy(buf, 0, bd.Scan0, buf.Length);
+                }
+                finally { synthWp.UnlockBits(bd); }
+
+                Rectangle monRect = new Rectangle(0, 0, 640, 360); // exact 16:10 -> 16:9 ratio (scale=2/3, 640x400, excessY=40)
+                Rectangle cropRect = new Rectangle(190, 120, 210, 165);
+                Point[] shifts = new[] { Point.Empty, new Point(0, 13), new Point(-7, 11) };
+                for (int pos = 0; pos <= 4; pos++)
+                {
+                    foreach (var sh in shifts)
+                    {
+                        using (var fullBmp = new Bitmap(monRect.Width, monRect.Height, PixelFormat.Format32bppPArgb))
+                        using (var cropBmp = new Bitmap(cropRect.Width, cropRect.Height, PixelFormat.Format32bppPArgb))
+                        {
+                            using (var gFull = Graphics.FromImage(fullBmp))
+                            {
+                                gFull.Clear(Color.FromArgb(255, 16, 20, 24));
+                                gFull.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                                gFull.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
+                                DesktopWallpaperCache.DrawWallpaperBitmapIntoRegion(gFull, synthWp, monRect, monRect, pos, sh);
+                            }
+                            using (var gCrop = Graphics.FromImage(cropBmp))
+                            {
+                                gCrop.Clear(Color.FromArgb(255, 16, 20, 24));
+                                gCrop.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                                gCrop.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
+                                DesktopWallpaperCache.DrawWallpaperBitmapIntoRegion(gCrop, synthWp, monRect, cropRect, pos, sh);
+                            }
+                            int maxDiff = 0;
+                            for (int y = 0; y < cropRect.Height; y += 2)
+                            {
+                                for (int x = 0; x < cropRect.Width; x += 2)
+                                {
+                                    Color c1 = cropBmp.GetPixel(x, y);
+                                    Color c2 = fullBmp.GetPixel(cropRect.X + x, cropRect.Y + y);
+                                    int d = Math.Max(Math.Abs(c1.R - c2.R), Math.Max(Math.Abs(c1.G - c2.G), Math.Abs(c1.B - c2.B)));
+                                    if (d > maxDiff) maxDiff = d;
+                                }
+                            }
+                            Check(maxDiff <= 2,
+                                string.Format("Sub-rect wallpaper draw diverged from full monitor draw for pos={0} shift={1}: maxDiff={2}", pos, sh, maxDiff));
+                        }
+                    }
+                }
+
+                // 4. Live screen self-calibration must recover exact Win11 +27px (and negative/zero) vertical Fill shifts,
+                //    resist a completely occluded outlier patch, and reject unrelated crossfade/mismatched wallpapers!
+                Rectangle hdMon = new Rectangle(0, 0, 1280, 720); // 960x600 -> 1280x800 in DWPOS_FILL (excessY=80, nominal drawY=-40)
+                Func<Point, Rectangle[], bool, List<DesktopWallpaperCache.ScreenPatch>> makeSyntheticScreenPatches = (trueShift, patchRects, corruptLast) =>
+                {
+                    var list = new List<DesktopWallpaperCache.ScreenPatch>();
+                    using (var realScreen = new Bitmap(hdMon.Width, hdMon.Height, PixelFormat.Format32bppPArgb))
+                    {
+                        using (var g = Graphics.FromImage(realScreen))
+                        {
+                            g.Clear(Color.Black);
+                            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.Half;
+                            DesktopWallpaperCache.DrawWallpaperBitmapIntoRegion(g, synthWp, hdMon, hdMon, 4, trueShift);
+                        }
+                        for (int i = 0; i < patchRects.Length; i++)
+                        {
+                            Rectangle pr = patchRects[i];
+                            byte[] bytes = new byte[pr.Width * pr.Height * 4];
+                            var bdP = realScreen.LockBits(pr, ImageLockMode.ReadOnly, PixelFormat.Format32bppPArgb);
+                            try
+                            {
+                                for (int y = 0; y < pr.Height; y++)
+                                    Marshal.Copy(IntPtr.Add(bdP.Scan0, y * bdP.Stride), bytes, y * pr.Width * 4, pr.Width * 4);
+                            }
+                            finally { realScreen.UnlockBits(bdP); }
+                            if (corruptLast && i == patchRects.Length - 1)
+                            {
+                                // Simulate an unknown overlay completely occluding one patch with solid magenta
+                                for (int j = 0; j < bytes.Length; j += 4) { bytes[j] = 240; bytes[j + 1] = 10; bytes[j + 2] = 240; bytes[j + 3] = 255; }
+                            }
+                            list.Add(new DesktopWallpaperCache.ScreenPatch
+                            {
+                                ScreenRect = pr,
+                                Bgra = bytes,
+                                Width = pr.Width,
+                                Height = pr.Height,
+                                TextureScore = DesktopWallpaperCache.ComputePatchTextureScore(bytes, pr.Width, pr.Height, true, false)
+                            });
+                        }
+                    }
+                    return list;
+                };
+
+                Rectangle[] sampleLocations = new[]
+                {
+                    new Rectangle(120, 280, 48, 48),
+                    new Rectangle(420, 320, 48, 48),
+                    new Rectangle(760, 350, 48, 48),
+                    new Rectangle(1020, 300, 48, 48),
+                    new Rectangle(600, 460, 48, 48)
+                };
+
+                int maxDx, maxDy; bool pV, pH;
+                DesktopWallpaperCache.ComputeCalibrationSearchWindow(synthWp.Width, synthWp.Height, hdMon, 4, out maxDx, out maxDy, out pV, out pH);
+                Check(pV && !pH && maxDy >= 56, "16:10->16:9 Fill must prioritize vertical gradient and cover full excessY/2 shift range.");
+
+                Point foundShift; double e0, eBest; bool cacheable;
+                var patchesPlus27 = makeSyntheticScreenPatches(new Point(0, 27), sampleLocations, false);
+                Check(DesktopWallpaperCache.TryFindAlignmentOffset(patchesPlus27, synthWp, hdMon, 4, maxDx, maxDy, out foundShift, out e0, out eBest, out cacheable),
+                    "Self-calibration must succeed on +27px shifted Win11 Fill wallpaper.");
+                Check(foundShift == new Point(0, 27) && cacheable && eBest < 1.5 && e0 > 8.0,
+                    string.Format("Expected exact (0, 27) calibration recovery! Got {0} e0={1:F2} eBest={2:F2} cache={3}", foundShift, e0, eBest, cacheable));
+
+                // Outlier immunity: 1 of 5 patches completely occluded by an overlay must STILL recover exact (0, 27)!
+                var patchesWithOutlier = makeSyntheticScreenPatches(new Point(0, 27), sampleLocations, true);
+                Check(DesktopWallpaperCache.TryFindAlignmentOffset(patchesWithOutlier, synthWp, hdMon, 4, maxDx, maxDy, out foundShift, out e0, out eBest, out cacheable),
+                    "Self-calibration must tolerate a single occluded outlier patch via trimmed mean.");
+                Check(foundShift == new Point(0, 27) && cacheable,
+                    "Expected exact (0, 27) even with 1 occluded outlier patch! Got " + foundShift);
+
+                // Negative vertical shift (-23px)
+                var patchesMinus23 = makeSyntheticScreenPatches(new Point(0, -23), sampleLocations, false);
+                Check(DesktopWallpaperCache.TryFindAlignmentOffset(patchesMinus23, synthWp, hdMon, 4, maxDx, maxDy, out foundShift, out e0, out eBest, out cacheable) &&
+                    foundShift == new Point(0, -23) && cacheable,
+                    "Expected exact (0, -23) recovery! Got " + foundShift);
+
+                // Zero shift (already aligned Windows 10/11 desktop)
+                var patchesZero = makeSyntheticScreenPatches(Point.Empty, sampleLocations, false);
+                Check(DesktopWallpaperCache.TryFindAlignmentOffset(patchesZero, synthWp, hdMon, 4, maxDx, maxDy, out foundShift, out e0, out eBest, out cacheable) &&
+                    foundShift == Point.Empty && cacheable && e0 < 1.0,
+                    "Aligned desktop must stay at exact (0, 0) with cacheable=true.");
+
+                // Unrecognized / mismatched image (e.g. slideshow crossfade): MUST NOT apply bogus shift or poison cache!
+                var bogusPatches = makeSyntheticScreenPatches(Point.Empty, sampleLocations, false);
+                foreach (var bp in bogusPatches)
+                {
+                    for (int j = 0; j < bp.Bgra.Length; j += 4) { bp.Bgra[j] = (byte)(255 - bp.Bgra[j]); bp.Bgra[j + 1] = 20; bp.Bgra[j + 2] = 220; }
+                }
+                bool bogusOk = DesktopWallpaperCache.TryFindAlignmentOffset(bogusPatches, synthWp, hdMon, 4, maxDx, maxDy, out foundShift, out e0, out eBest, out cacheable);
+                Check(!bogusOk && foundShift == Point.Empty && !cacheable,
+                    "Unmatched wallpaper must fail confidence gate without shifting or poisoning cache.");
+            }
         }
 
         internal static void Run(string dir)

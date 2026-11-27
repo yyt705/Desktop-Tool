@@ -390,6 +390,8 @@ namespace DeskFences
             _watchTimer = new Timer { Interval = 350 };
             _watchTimer.Tick += OnWatchTimerTick;
             RefreshDesktopHostHandles(false);
+            if (DesktopReady && _controller.IsOutOfProcessHost())
+                DesktopWallpaperCache.WarmAsync(CaptureWallpaperCalibrationContext(Rectangle.Empty));
             _watchTimer.Start();
 
             SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
@@ -2192,6 +2194,41 @@ namespace DeskFences
         {
             if (!DesktopReady || !_controller.IsOutOfProcessHost()) return IntPtr.Zero;
             return NativeMethods.FindDesktopWallpaperWorker();
+        }
+
+        internal WallpaperCalibrationContext CaptureWallpaperCalibrationContext(Rectangle hintScreenRect)
+        {
+            if (!DesktopReady || !_controller.IsOutOfProcessHost()) return null;
+            var excluded = new List<Rectangle>(_forms.Count + (_inputSnapshot != null ? _inputSnapshot.Count : 0));
+            foreach (var form in _forms.Values)
+            {
+                if (form != null && !form.IsDisposed && form.Visible)
+                {
+                    Rectangle r = form.Bounds;
+                    r.Inflate(10, 10);
+                    excluded.Add(r);
+                }
+            }
+            if (_inputSnapshot != null)
+            {
+                for (int i = 0; i < _inputSnapshot.Count; i++)
+                {
+                    var ic = _inputSnapshot[i];
+                    Rectangle u = Rectangle.Union(ic.ScreenBounds, Rectangle.Union(ic.IconBounds, ic.LabelBounds));
+                    if (u.Width > 0 && u.Height > 0)
+                    {
+                        u.Inflate(10, 8);
+                        excluded.Add(u);
+                    }
+                }
+            }
+            IntPtr worker = NativeMethods.FindDesktopWallpaperWorker();
+            return new WallpaperCalibrationContext
+            {
+                HintScreenRect = hintScreenRect,
+                ExcludedRects = excluded,
+                DesktopShellHwnds = new[] { _controller.DesktopOwner, _controller.DefView, _controller.ListView, worker }
+            };
         }
 
         internal Color? GetInProcessDesktopBackColor()
