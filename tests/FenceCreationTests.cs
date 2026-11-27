@@ -219,6 +219,49 @@ namespace DeskFences
                     for (int i = 0; i < paths.Length; i++)
                         Check(view.Items[i].Position == startPositions[i],
                             "Wrapping selected icons in place must move ZERO icons on native ListView (item " + i + " moved)!");
+
+                    // C. Manual drag-in whose Explorer drop lands on the fence's 1-cell border ring while
+                    //    the cursor released inside the fence's inner grid (and even if not in _knownIconCells yet!)
+                    //    MUST be adopted into the fence's free inner cell rather than expelled outside!
+                    var outsider = icons[0]; // BlockA at (1, 0), NOT in wrappedFence (6,1,5,4 -> inner 7..9, 2..3)
+                    var gesture = new DesktopDragGesture();
+                    typeof(FenceManager).GetField("_desktopDrag", Instance).SetValue(mgr, gesture);
+                    typeof(FenceManager).GetField("_membership", Instance).SetValue(mgr, new DesktopMembership());
+                    typeof(FenceManager).GetField("_desktopMenu", Instance).SetValue(mgr, new DesktopMenuPlacement());
+                    typeof(FenceManager).GetField("_recentContextPlacements", Instance).SetValue(mgr,
+                        Activator.CreateInstance(typeof(FenceManager).GetField("_recentContextPlacements", Instance).FieldType, true));
+                    typeof(FenceManager).GetField("_forms", Instance).SetValue(mgr, new Dictionary<string, FenceChromeForm>());
+
+                    // Press on BlockA at (1,0), release cursor inside wrappedFence's inner cell (7,2),
+                    // while Explorer bumps BlockA onto wrappedFence's left border ring at (6,2)!
+                    Point pressPt = new Point(outsider.IconBounds.Left + 8, outsider.IconBounds.Top + 8);
+                    Point dropInsideFencePt = new Point(grid.OriginX + 7 * cell + 20, grid.OriginY + 2 * cell + 20);
+                    gesture.Begin(pressPt, icons);
+                    gesture.Release(dropInsideFencePt, true, new Size(4, 4), 100);
+                    view.SetSnap(false);
+                    view.Items[0].Position = new Point(cell * 6 + 8, cell * 2 + 8); // landed on left border ring of wrappedFence!
+                    view.Items[0].Selected = true;
+                    view.SetSnap(true);
+                    // Intentionally keep _knownIconCells EMPTY to also prove brand-new icons (wasKnown==false) adopt cleanly!
+                    typeof(FenceManager).GetField("_exiting", Instance).SetValue(mgr, false);
+                    try
+                    {
+                        typeof(FenceManager).GetMethod("EnforceAllRules", Instance).Invoke(mgr, new object[] { true, false, false });
+                    }
+                    finally
+                    {
+                        typeof(FenceManager).GetField("_exiting", Instance).SetValue(mgr, true);
+                        string cfgFile = AppConfig.GetConfigPath();
+                        if (cfgFile.StartsWith(Path.GetFullPath(Path.GetTempPath()), StringComparison.OrdinalIgnoreCase) && File.Exists(cfgFile))
+                            File.Delete(cfgFile);
+                    }
+
+                    Check(wrappedFence.MemberIconIds.Contains(outsider.Identity),
+                        "Manual drag-in released inside fence and snapped onto border ring MUST be adopted into the fence, not expelled!");
+                    var afterDragIn = controller.GetAllIcons().Single(x => x.Identity == outsider.Identity);
+                    Check(wrappedFence.IsInInnerRect(afterDragIn.GridCol(grid), afterDragIn.GridRow(grid)),
+                        "Adopted border-ring drag-in must smoothly land inside a free inner slot of the fence! Got (" +
+                        afterDragIn.GridCol(grid) + "," + afterDragIn.GridRow(grid) + ")");
                 }
             });
         }

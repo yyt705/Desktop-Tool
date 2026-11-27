@@ -15,14 +15,34 @@ namespace DeskFences
     {
         private readonly Dictionary<string, Point> _origins = new Dictionary<string, Point>(StringComparer.OrdinalIgnoreCase);
         private string _anchor;
-        private Point _press, _delta;
+        private Point _press, _drop, _delta;
         private long _released = -1;
         private bool _anchorMoved;
         public bool Pressed { get { return _anchor != null && _released < 0; } }
+        public bool HasPendingRelease { get { return _released >= 0 && _origins.Count > 0; } }
+        public Point DropPoint { get { return _drop; } }
 
         public bool WaitingForItem(string identity)
         {
             return _released >= 0 && _origins.ContainsKey(identity);
+        }
+
+        public DesktopDragGesture DetachPendingRelease()
+        {
+            if (!HasPendingRelease) return null;
+            var copy = new DesktopDragGesture
+            {
+                _anchor = _anchor,
+                _press = _press,
+                _drop = _drop,
+                _delta = _delta,
+                _released = _released,
+                _anchorMoved = _anchorMoved
+            };
+            foreach (var kv in _origins)
+                copy._origins[kv.Key] = kv.Value;
+            Cancel();
+            return copy;
         }
 
         public void Cancel()
@@ -45,9 +65,11 @@ namespace DeskFences
                 if (string.IsNullOrEmpty(icon.Identity)) continue;
                 bool directHit = icon.IconBounds.Contains(press) || icon.LabelBounds.Contains(press);
                 bool boxHit = !directHit && icon.ScreenBounds.Contains(press);
-                if (!directHit && !boxHit) continue;
+                bool haloHit = !directHit && !boxHit && icon.ScreenBounds.Width > 0 && icon.ScreenBounds.Height > 0 &&
+                               Rectangle.Inflate(icon.ScreenBounds, 6, 6).Contains(press);
+                if (!directHit && !boxHit && !haloHit) continue;
 
-                int priority = (directHit ? 2 : 1) + (icon.Selected ? 2 : 0);
+                int priority = (directHit ? 3 : (boxHit ? 2 : 0)) + (icon.Selected ? 2 : 0);
                 Rectangle refRect = directHit ? (icon.IconBounds.Contains(press) ? icon.IconBounds : icon.LabelBounds) : icon.ScreenBounds;
                 double cx = refRect.Left + refRect.Width * 0.5;
                 double cy = refRect.Top + refRect.Height * 0.5;
@@ -69,6 +91,7 @@ namespace DeskFences
 
         public void Release(Point point, bool onDesktop, Size dragThreshold, long now)
         {
+            _drop = point;
             _delta = new Point(point.X - _press.X, point.Y - _press.Y);
             if (_anchor == null || !onDesktop ||
                 (Math.Abs(_delta.X) < Math.Max(1, dragThreshold.Width / 2) &&
@@ -84,12 +107,12 @@ namespace DeskFences
         {
             var moved = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             if (_released < 0) return moved;
-            if (now - _released > 800) { Cancel(); return moved; }
-            // Allow up to ~1.25 cells of slack so Explorer's snap-to-grid auto-bump onto an adjacent
-            // free cell (when dropping near an occupied slot or multi-selecting) is still recognized,
-            // while large unrelated Explorer reflows remain rejected.
-            int tolX = Math.Max(3, metrics.CellWidth + metrics.CellWidth / 4 + 2);
-            int tolY = Math.Max(3, metrics.CellHeight + metrics.CellHeight / 4 + 2);
+            if (now - _released > 1200) { Cancel(); return moved; }
+            // Allow up to ~2.25 cells of slack so Explorer's snap-to-grid collision bump
+            // (when dropping onto occupied slots or multi-selecting into a crowded fence) is
+            // still recognized, while large unrelated Explorer reflows remain rejected.
+            int tolX = Math.Max(3, metrics.CellWidth * 2 + metrics.CellWidth / 4 + 2);
+            int tolY = Math.Max(3, metrics.CellHeight * 2 + metrics.CellHeight / 4 + 2);
             foreach (var icon in icons)
             {
                 Point origin;
@@ -254,6 +277,9 @@ namespace DeskFences
         private bool _lastDesktopVisible = true;
 
         private readonly DesktopDragGesture _desktopDrag = new DesktopDragGesture();
+        private readonly List<DesktopDragGesture> _pendingCompletedDrags = new List<DesktopDragGesture>();
+        private Point _lastDesktopPressPt;
+        private bool _desktopMarqueePending;
         private readonly DesktopMenuPlacement _desktopMenu = new DesktopMenuPlacement();
         private bool _nonDesktopPressActive;
         private string _externalDropFenceId;
@@ -460,10 +486,13 @@ namespace DeskFences
             _externalDropMs = -1;
         }
 
-        private void ResetDesktopInput()
+        private void ResetDesktopInput(bool clearCompletedDrags = true)
         {
             ++_pressSequence;
             _desktopDrag.Cancel();
+            if (clearCompletedDrags && _pendingCompletedDrags != null)
+                _pendingCompletedDrags.Clear();
+            _desktopMarqueePending = false;
             _desktopMenu.Cancel();
             _popupPress = null;
             _highlightedItem = null;
@@ -529,7 +558,17 @@ namespace DeskFences
             bool desktop = IsExposedDesktopPoint(point.X, point.Y);
             if (message == NativeMethods.WM_LBUTTONDOWN)
             {
-                ResetDesktopInput();
+                // Preserve any just-released desktop icon drag so rapid back-to-back icon drags
+                // into a fence NEVER cancel the previous icon's attribution before Explorer delivers it!
+                var completed = _desktopDrag.DetachPendingRelease();
+                if (completed != null && _pendingCompletedDrags != null)
+                {
+                    _pendingCompletedDrags.Add(completed);
+                    if (_pendingCompletedDrags.Count > 6)
+                        _pendingCompletedDrags.RemoveAt(0);
+                }
+                ResetDesktopInput(false);
+                ClearPostSwitchGuard();
                 if (!physicalMouse) return;
                 if (!desktop)
                 {
@@ -538,7 +577,9 @@ namespace DeskFences
                     _nonDesktopPressActive = true;
                     return;
                 }
+                _lastDesktopPressPt = point;
                 _desktopDrag.Begin(point, _inputSnapshot);
+                _desktopMarqueePending = !_desktopDrag.Pressed;
                 int sequence = _pressSequence;
                 _uiInvoker.BeginInvoke((Action)(() =>
                 {
@@ -546,7 +587,11 @@ namespace DeskFences
                     // geometry for fast gestures that finished before this callback ran.
                     if (sequence != _pressSequence || (NativeMethods.GetAsyncKeyState(NativeMethods.VK_LBUTTON) & 0x8000) == 0) return;
                     var icons = _controller.GetAllIcons();
-                    if (sequence == _pressSequence && _controller.SnapshotComplete) _desktopDrag.Begin(point, icons);
+                    if (sequence == _pressSequence && _controller.SnapshotComplete)
+                    {
+                        _inputSnapshot = icons;
+                        _desktopDrag.Begin(point, icons);
+                    }
                 }));
             }
             else
@@ -554,6 +599,8 @@ namespace DeskFences
                 ++_pressSequence;
                 bool externalDrag = _nonDesktopPressActive;
                 _nonDesktopPressActive = false;
+                bool wasMarquee = _desktopMarqueePending;
+                _desktopMarqueePending = false;
                 if (externalDrag && desktop && physicalMouse)
                 {
                     FenceConfig dropZone = FindFenceVisualBodyAt(point);
@@ -567,8 +614,27 @@ namespace DeskFences
                     return;
                 }
                 bool pressed = _desktopDrag.Pressed;
-                _desktopDrag.Release(point, desktop && physicalMouse, SystemInformation.DragSize, _sessionClock.ElapsedMilliseconds);
-                if (pressed && desktop) _uiInvoker.BeginInvoke((Action)TriggerSubFrameBurstCheck);
+                // When already dragging a desktop icon, releasing over our own FenceChromeForm border/header,
+                // desktop WorkerW, or Explorer's SysDragImage preview window is still a valid desktop drop!
+                bool dropOnDesktop = desktop || (pressed && IsDesktopOrOverlayDropPoint(point.X, point.Y));
+                _desktopDrag.Release(point, dropOnDesktop && physicalMouse, SystemInformation.DragSize, _sessionClock.ElapsedMilliseconds);
+                if (pressed && dropOnDesktop)
+                {
+                    _uiInvoker.BeginInvoke((Action)TriggerSubFrameBurstCheck);
+                }
+                else if (wasMarquee && desktop && physicalMouse &&
+                         (Math.Abs(point.X - _lastDesktopPressPt.X) >= SystemInformation.DragSize.Width ||
+                          Math.Abs(point.Y - _lastDesktopPressPt.Y) >= SystemInformation.DragSize.Height))
+                {
+                    // User just finished a desktop marquee selection: refresh _inputSnapshot immediately
+                    // so a rapid subsequent multi-icon drag sees fresh Selected=true flags!
+                    _uiInvoker.BeginInvoke((Action)(() =>
+                    {
+                        if (!DesktopReady || _isMutatingFence || _isEnforcing) return;
+                        var icons = _controller.GetAllIcons(false);
+                        if (_controller.SnapshotComplete) _inputSnapshot = icons;
+                    }));
+                }
             }
         }
 
@@ -739,6 +805,35 @@ namespace DeskFences
             }
         }
 
+        private bool IsDesktopOrOverlayDropPoint(int screenX, int screenY)
+        {
+            if (IsExposedDesktopPoint(screenX, screenY)) return true;
+            if (!DesktopReady) return false;
+            IntPtr hwnd = NativeMethods.WindowFromPoint(new NativeMethods.POINT { X = screenX, Y = screenY });
+            if (hwnd == IntPtr.Zero) return false;
+
+            // Any part of our own fence overlay windows (including title bar or 7px resize rim) sits on the desktop
+            foreach (var form in _forms.Values)
+            {
+                if (form.IsHandleCreated && hwnd == form.Handle) return true;
+                if (form.Backdrop != null && form.Backdrop.IsHandleCreated && hwnd == form.Backdrop.Handle) return true;
+            }
+
+            // Desktop WorkerW (e.g. Wallpaper Engine) or Explorer's SysDragImage drag ghost window
+            uint pid, deskPid;
+            if (NativeMethods.GetWindowThreadProcessId(hwnd, out pid) != 0 &&
+                NativeMethods.GetWindowThreadProcessId(_controller.ListView, out deskPid) != 0 &&
+                pid == deskPid)
+            {
+                var sb = new System.Text.StringBuilder(64);
+                NativeMethods.GetClassName(hwnd, sb, sb.Capacity);
+                string cls = sb.ToString();
+                if (cls == "WorkerW" || cls == "Progman" || cls == "SysDragImage" || cls == "SHELLDLL_DefView")
+                    return true;
+            }
+            return false;
+        }
+
         private bool IsExposedDesktopPoint(int screenX, int screenY)
         {
             IntPtr hwnd = NativeMethods.WindowFromPoint(new NativeMethods.POINT { X = screenX, Y = screenY });
@@ -768,6 +863,7 @@ namespace DeskFences
 
         private FenceConfig FindFenceVisualBodyAt(Point point)
         {
+            if (_forms == null) return null;
             foreach (var form in _forms.Values)
             {
                 if (!form.IsHandleCreated || form.IsDisposed || !form.Visible) continue;
@@ -1778,11 +1874,43 @@ namespace DeskFences
 
             if (done)
             {
+                var finishedTracks = _iconAnimTracks;
                 _iconAnimTimer.Stop();
                 _iconAnimWatch.Stop();
                 _iconAnimTracks = null;
                 _isAnimatingIcons = false;
+                ApplyTracksToInputSnapshot(finishedTracks);
+                _desktopDirty = true;
                 ReleaseFreeIconMoveModeIfIdle();
+            }
+        }
+
+        private void ApplyTracksToInputSnapshot(List<IconSlideTrack> tracks)
+        {
+            if (tracks == null || tracks.Count == 0 || _inputSnapshot == null || _inputSnapshot.Count == 0)
+                return;
+            var deltas = new Dictionary<string, Point>(StringComparer.OrdinalIgnoreCase);
+            foreach (var tr in tracks)
+            {
+                if (string.IsNullOrEmpty(tr.IconInfo.Identity)) continue;
+                int dx = tr.TargetPos.X - tr.StartPos.X;
+                int dy = tr.TargetPos.Y - tr.StartPos.Y;
+                if (dx != 0 || dy != 0)
+                    deltas[tr.IconInfo.Identity] = new Point(dx, dy);
+            }
+            if (deltas.Count == 0) return;
+            for (int i = 0; i < _inputSnapshot.Count; i++)
+            {
+                var ic = _inputSnapshot[i];
+                Point shift;
+                if (!string.IsNullOrEmpty(ic.Identity) && deltas.TryGetValue(ic.Identity, out shift))
+                {
+                    ic.ClientPosition.Offset(shift);
+                    ic.ScreenBounds.Offset(shift);
+                    ic.IconBounds.Offset(shift);
+                    ic.LabelBounds.Offset(shift);
+                    _inputSnapshot[i] = ic;
+                }
             }
         }
 
@@ -1790,17 +1918,19 @@ namespace DeskFences
         {
             if (!_isAnimatingIcons) return;
 
+            var tracks = _iconAnimTracks;
             _iconAnimTimer.Stop();
             _iconAnimWatch.Stop();
 
             try
             {
                 if (!applyIconPositions || !_controller.HasCurrentHandles() ||
-                    _attachedGeneration != _controller.HostGeneration || _iconAnimTracks == null) return;
-                var finalBatch = new List<KeyValuePair<string, Point>>(_iconAnimTracks.Count);
-                foreach (var tr in _iconAnimTracks)
+                    _attachedGeneration != _controller.HostGeneration || tracks == null) return;
+                var finalBatch = new List<KeyValuePair<string, Point>>(tracks.Count);
+                foreach (var tr in tracks)
                     finalBatch.Add(new KeyValuePair<string, Point>(tr.IconInfo.Identity, tr.TargetPos));
                 _controller.MoveIconsBatch(finalBatch);
+                ApplyTracksToInputSnapshot(tracks);
             }
             finally
             {
@@ -2527,8 +2657,47 @@ namespace DeskFences
                         _recentContextPlacements.Remove(k);
                 }
 
-                var dragged = allowManualMembershipChange ? _desktopDrag.MovedItems(icons, m, nowMs) :
-                    new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var dragged = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var dragDropPoints = new Dictionary<string, Point>(StringComparer.OrdinalIgnoreCase);
+                if (allowManualMembershipChange)
+                {
+                    if (_pendingCompletedDrags != null && _pendingCompletedDrags.Count > 0)
+                    {
+                        for (int gi = _pendingCompletedDrags.Count - 1; gi >= 0; gi--)
+                        {
+                            var g = _pendingCompletedDrags[gi];
+                            Point gp = g.DropPoint;
+                            foreach (string id in g.MovedItems(icons, m, nowMs))
+                            {
+                                dragged.Add(id);
+                                dragDropPoints[id] = gp;
+                            }
+                            if (!g.HasPendingRelease)
+                                _pendingCompletedDrags.RemoveAt(gi);
+                        }
+                    }
+                    if (_desktopDrag != null)
+                    {
+                        Point curDropPt = _desktopDrag.DropPoint;
+                        foreach (string id in _desktopDrag.MovedItems(icons, m, nowMs))
+                        {
+                            dragged.Add(id);
+                            dragDropPoints[id] = curDropPt;
+                        }
+                    }
+                }
+                bool anyDragPending = (_desktopDrag != null && (_desktopDrag.Pressed || _desktopDrag.HasPendingRelease)) ||
+                    (_pendingCompletedDrags != null && _pendingCompletedDrags.Count > 0);
+                Func<string, bool> isWaitingForDragItem = id =>
+                {
+                    if (_desktopDrag != null && _desktopDrag.WaitingForItem(id)) return true;
+                    if (_pendingCompletedDrags != null)
+                    {
+                        foreach (var g in _pendingCompletedDrags)
+                            if (g.WaitingForItem(id)) return true;
+                    }
+                    return false;
+                };
                 var contextFence = allowManualMembershipChange && _desktopMenu.Command != DesktopMenuCommand.None ?
                     Config.Fences.FirstOrDefault(f => f.Id == _desktopMenu.FenceId) : null;
                 FenceConfig externalDropFence = null;
@@ -2561,7 +2730,7 @@ namespace DeskFences
                 // Anti-Explorer-rebound guard right after a display switch: if Explorer's delayed IconLayouts
                 // restore scrambles icons within 2.5s while the user is NOT manually dragging, silently restore
                 // them back to the profile's target cells without polluting the saved profile!
-                if (dragged.Count > 0 || contextFence != null || externalDropFence != null || fallbackContextFence != null)
+                if (dragged.Count > 0 || anyDragPending || contextFence != null || externalDropFence != null || fallbackContextFence != null)
                 {
                     ClearPostSwitchGuard();
                 }
@@ -2611,6 +2780,7 @@ namespace DeskFences
                         new IntPtr(-1), new IntPtr(NativeMethods.LVNI_FOCUSED));
                 var toExpel = new List<DesktopIconInfo>();
                 var toKeepInside = new List<KeyValuePair<DesktopIconInfo, FenceConfig>>();
+                var toAdoptDragIn = new List<Tuple<DesktopIconInfo, FenceConfig, Point>>();
                 var toPlaceInContextZone = new List<KeyValuePair<DesktopIconInfo, FenceConfig>>();
                 var toRestoreRecentContext = new List<KeyValuePair<DesktopIconInfo, RecentContextPlacement>>();
 
@@ -2629,8 +2799,9 @@ namespace DeskFences
                     FenceConfig currentOwner;
                     ownerMap.TryGetValue(ic.Identity, out currentOwner);
 
-                    bool manualDrop = wasKnown && dragged.Contains(ic.Identity);
-                    if (allowManualMembershipChange && !manualDrop && _desktopDrag.WaitingForItem(ic.Identity))
+                    // A verified physical drag-drop must be honored even for newly created desktop files not yet in _knownIconCells!
+                    bool manualDrop = dragged.Contains(ic.Identity);
+                    if (allowManualMembershipChange && !manualDrop && isWaitingForDragItem(ic.Identity))
                         continue;
                     if (currentOwner == null && contextFence != null && _desktopMenu.Take(ic, ic.Index == editingIndex, nowMs))
                     {
@@ -2696,18 +2867,35 @@ namespace DeskFences
                     if (manualDrop)
                     {
                         _recentContextPlacements.Remove(ic.Identity);
+                        Point dropPt;
+                        bool hasDropPt = dragDropPoints.TryGetValue(ic.Identity, out dropPt);
+                        FenceConfig dropBodyFence = hasDropPt ? FindFenceVisualBodyAt(dropPt) : null;
 
                         // User manually dragged this icon (works for single or multi-icon drags!)
                         if (hitBorder != null)
                         {
-                            // Dropped onto one of the 4 border edges -> expel outside & remove membership
-                            if (currentOwner != null)
+                            // If the cursor actually released INSIDE the fence's visual glass body or inner grid
+                            // (e.g. near a glass edge, or onto an occupied inner slot so Explorer bumped the icon
+                            // onto the 1-cell border ring), adopt into that fence's nearest free inner cell instead of expelling!
+                            int dropCol = hasDropPt ? (int)Math.Floor((dropPt.X - m.OriginX) / (double)Math.Max(1, m.CellWidth)) : int.MinValue;
+                            int dropRow = hasDropPt ? (int)Math.Floor((dropPt.Y - m.OriginY) / (double)Math.Max(1, m.CellHeight)) : int.MinValue;
+                            bool intendedIntoBorderFence = hasDropPt &&
+                                (dropBodyFence == hitBorder || hitBorder.IsInInnerRect(dropCol, dropRow));
+                            if (intendedIntoBorderFence)
                             {
-                                currentOwner.MemberIconIds.RemoveAll(n => string.Equals(n, ic.Identity, StringComparison.OrdinalIgnoreCase));
-                                ownerMap.Remove(ic.Identity);
-                                configDirty = true;
+                                toAdoptDragIn.Add(Tuple.Create(ic, hitBorder, dropPt));
                             }
-                            toExpel.Add(ic);
+                            else
+                            {
+                                // Truly dropped outside on the border edge -> expel outside & remove membership
+                                if (currentOwner != null)
+                                {
+                                    currentOwner.MemberIconIds.RemoveAll(n => string.Equals(n, ic.Identity, StringComparison.OrdinalIgnoreCase));
+                                    ownerMap.Remove(ic.Identity);
+                                    configDirty = true;
+                                }
+                                toExpel.Add(ic);
+                            }
                         }
                         else if (hitInner != null)
                         {
@@ -2721,6 +2909,12 @@ namespace DeskFences
                                 ownerMap[ic.Identity] = hitInner;
                                 configDirty = true;
                             }
+                        }
+                        else if (dropBodyFence != null && dropBodyFence != currentOwner)
+                        {
+                            // Cursor released strictly inside another fence's visual glass body, but Explorer bounced
+                            // the icon outside its outer ring because the targeted inner slot was occupied -> adopt & glide inside!
+                            toAdoptDragIn.Add(Tuple.Create(ic, dropBodyFence, dropPt));
                         }
                         else
                         {
@@ -2757,7 +2951,7 @@ namespace DeskFences
                 foreach (var ic in icons)
                     finalCells[ic.Identity] = new Point(ic.GridCol(m), ic.GridRow(m));
 
-                if (toKeepInside.Count > 0 || toPlaceInContextZone.Count > 0 || toRestoreRecentContext.Count > 0 || toExpel.Count > 0)
+                if (toKeepInside.Count > 0 || toAdoptDragIn.Count > 0 || toPlaceInContextZone.Count > 0 || toRestoreRecentContext.Count > 0 || toExpel.Count > 0)
                 {
                     var occupied = new HashSet<long>();
                     Func<int, int, long> keyOf = (c, r) => (((long)c) << 32) | (uint)r;
@@ -2768,6 +2962,70 @@ namespace DeskFences
 
                     var immediateTracks = new List<IconSlideTrack>();
                     var animTracks = new List<IconSlideTrack>();
+
+                    // 0c. Manual drag-in that landed on a fence's border ring (or bounced off an occupied slot):
+                    //     adopt into the target fence's nearest free inner cell; only expel if the fence is 100% full!
+                    foreach (var triple in toAdoptDragIn)
+                    {
+                        DesktopIconInfo ic = triple.Item1;
+                        FenceConfig targetFence = triple.Item2;
+                        Point refDropPt = triple.Item3;
+                        int curCol = ic.GridCol(m);
+                        int curRow = ic.GridRow(m);
+                        occupied.Remove(keyOf(curCol, curRow));
+
+                        FenceConfig prevOwner;
+                        ownerMap.TryGetValue(ic.Identity, out prevOwner);
+
+                        Point destCell;
+                        bool placedInside = FindNearestFreeInnerCell(targetFence, refDropPt, m, occupied, out destCell);
+                        if (placedInside)
+                        {
+                            if (prevOwner != targetFence)
+                            {
+                                if (prevOwner != null)
+                                    prevOwner.MemberIconIds.RemoveAll(n => string.Equals(n, ic.Identity, StringComparison.OrdinalIgnoreCase));
+                                if (!targetFence.MemberIconIds.Any(n => string.Equals(n, ic.Identity, StringComparison.OrdinalIgnoreCase)))
+                                    targetFence.MemberIconIds.Add(ic.Identity);
+                                ownerMap[ic.Identity] = targetFence;
+                                configDirty = true;
+                            }
+                        }
+                        else
+                        {
+                            // Target fence is 100% full: keep icon outside all fences cleanly
+                            if (prevOwner != null)
+                            {
+                                prevOwner.MemberIconIds.RemoveAll(n => string.Equals(n, ic.Identity, StringComparison.OrdinalIgnoreCase));
+                                ownerMap.Remove(ic.Identity);
+                                configDirty = true;
+                            }
+                            if (Config.Fences.Any(f => f.IsInOuterRect(curCol, curRow)))
+                            {
+                                if (!FindNearestFreeOutsideCell(Config.Fences, refDropPt, workAreas, m, occupied, out destCell))
+                                    destCell = new Point(curCol, curRow);
+                            }
+                            else
+                            {
+                                destCell = new Point(curCol, curRow);
+                            }
+                        }
+
+                        occupied.Add(keyOf(destCell.X, destCell.Y));
+                        finalCells[ic.Identity] = destCell;
+                        if (destCell.X != curCol || destCell.Y != curRow)
+                        {
+                            int targetClientX = ic.ClientPosition.X + (destCell.X - curCol) * m.CellWidth;
+                            int targetClientY = ic.ClientPosition.Y + (destCell.Y - curRow) * m.CellHeight;
+                            animTracks.Add(new IconSlideTrack
+                            {
+                                IconInfo = ic,
+                                StartPos = ic.ClientPosition,
+                                TargetPos = new Point(targetClientX, targetClientY),
+                                LastSentPos = ic.ClientPosition
+                            });
+                        }
+                    }
 
                     // 0a. Re-assert any newly created context icon if Explorer's delayed post-insert layout tried to move it back
                     foreach (var pair in toRestoreRecentContext)
@@ -2953,6 +3211,7 @@ namespace DeskFences
                         foreach (var tr in immediateTracks)
                             immediateMoves.Add(new KeyValuePair<string, Point>(tr.IconInfo.Identity, tr.TargetPos));
                         _controller.MoveIconsBatch(immediateMoves);
+                        ApplyTracksToInputSnapshot(immediateTracks);
 
                         if (hasEditRect)
                         {
@@ -2982,6 +3241,7 @@ namespace DeskFences
                             foreach (var tr in animTracks)
                                 moves.Add(new KeyValuePair<string, Point>(tr.IconInfo.Identity, tr.TargetPos));
                             _controller.MoveIconsBatch(moves);
+                            ApplyTracksToInputSnapshot(animTracks);
                         }
                     }
                 }

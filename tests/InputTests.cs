@@ -65,7 +65,7 @@ namespace DeskFences
             gesture.Release(drop, true, new Size(4, 4), 7000);
             Check(gesture.MovedItems(after, metrics, 7001).Count == 0, "Escape or a desktop restart cancels the gesture");
 
-            // ScreenBounds gap hit-testing and 1-cell Explorer snap collision bump tolerance
+            // ScreenBounds gap hit-testing, hover-halo margin hit-testing, and 2-cell crowded-fence Explorer bump tolerance
             var boxIcon = new DesktopIconInfo { Identity = "gap", Selected = true, ParsingName = @"C:\Desktop\gap.txt",
                 ClientPosition = new Point(0, 0), IconBounds = new Rectangle(12, 4, 32, 32),
                 LabelBounds = new Rectangle(8, 42, 40, 18), ScreenBounds = new Rectangle(0, 0, 64, 64), Index = 0 };
@@ -75,6 +75,24 @@ namespace DeskFences
             bumped.ClientPosition = new Point(200, 0); // Explorer bumped 1 cell right due to occupied slot
             Check(gesture.MovedItems(new[] { bumped }, metrics, 8001).SetEquals(new[] { "gap" }),
                 "Clicking inside ScreenBounds and receiving a 1-cell Explorer snap bump must still count as manual drag");
+
+            // Hover-halo click (4px outside ScreenBounds) + 2-cell bump inside a crowded fence
+            gesture.Begin(new Point(68, 30), new[] { boxIcon });
+            gesture.Release(new Point(168, 30), true, new Size(4, 4), 8100);
+            bumped.ClientPosition = new Point(300, 0); // 2 cells bumped from +100 delta
+            Check(gesture.MovedItems(new[] { bumped }, metrics, 8101).SetEquals(new[] { "gap" }) &&
+                  gesture.DropPoint == new Point(168, 30),
+                "Hover-halo press and 2-cell crowded-fence Explorer bump must remain attributed as a manual drag");
+
+            // Rapid back-to-back icon drags: detaching a just-released gesture preserves Icon 1 when Icon 2 is clicked immediately!
+            gesture.Begin(press, before);
+            gesture.Release(drop, true, new Size(4, 4), 9000);
+            var detached = gesture.DetachPendingRelease();
+            Check(detached != null && detached.HasPendingRelease && !gesture.HasPendingRelease,
+                "Detaching a pending release must preserve the first icon's drop across an immediate second mouse press");
+            gesture.Begin(new Point(205, 8), before); // user immediately clicks Icon 3 before Icon 1 drop was consumed
+            Check(detached.MovedItems(after, metrics, 9050).SetEquals(new[] { "one", "two" }),
+                "Detached prior drop must still attribute Icon 1 & 2 even after a rapid subsequent click");
 
             var context = new DesktopMenuPlacement();
             var fresh = Icon("new", 0, true);
